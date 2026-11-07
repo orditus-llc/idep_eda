@@ -1,0 +1,1727 @@
+---
+title: "Telemetry Insights"
+author: "Thomas Shields"
+format:
+  html:
+    embed-resources: true
+    grid:
+      body-width: 1400px
+---
+
+::: {.panel-tabset}
+
+## Data Wrangling
+
+### Setup
+
+```{r}
+#| label: setup
+#| echo: true
+#| output: false
+
+# One-time install if needed (run in the R console):
+# install.packages(c("DBI", "RSQLite", "dplyr", "tidyr", "ggplot2"))
+
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+### Read in the data
+
+```{r}
+#| label: read-data
+#| echo: true
+#| output: false
+
+# Path is relative to this .qmd file (telemetry_analysis/)
+db_path <- "data_sets/idep_telemetry_10_24_26.sqlite"
+
+# Fallback for running chunks interactively from the workspace root
+if (!file.exists(db_path)) db_path <- file.path("telemetry_analysis", db_path)
+
+con <- dbConnect(SQLite(), db_path, flags = SQLITE_RO)  # read-only
+
+# What tables are in the database?
+tables <- dbListTables(con)
+tables
+
+# Columns in each table
+lapply(setNames(tables, tables), \(t) dbListFields(con, t))
+
+# Read every table into a named list of data frames
+telemetry <- lapply(setNames(tables, tables), \(t) dbReadTable(con, t))
+
+# Row counts per table
+sapply(telemetry, nrow)
+```
+
+### Look at the data
+
+```{r}
+#| label: preview
+#| echo: true
+#| output: false
+
+# Structure of each table
+for (t in names(telemetry)) {
+  cat("\n==", t, "==\n")
+  glimpse(telemetry[[t]])
+}
+
+# First rows of each table
+lapply(telemetry, head, n = 5)
+```
+
+### Clean the data
+
+```{r}
+#| label: clean-data
+#| echo: true
+#| output: false
+
+# Every JSON key that appears in details (e.g. species_id, message)
+keys <- dbGetQuery(con, "
+  SELECT DISTINCT j.key
+  FROM event_log, json_each(event_log.details) AS j
+  ORDER BY j.key")$key
+keys
+
+# One json_extract() per key; [0] unwraps the one-item list, e.g. ["95"] -> "95".
+# CAST to TEXT because some keys (e.g. input `value`) mix numbers and text.
+extract_cols <- paste0("CAST(json_extract(details, '$.", keys, "[0]') AS TEXT) AS \"",
+                       keys, "\"", collapse = ",\n  ")
+
+events <- dbGetQuery(con, paste0("
+  SELECT time, app_name, session, type,\n  ", extract_cols, "
+  FROM event_log")) |>
+  mutate(time = as.POSIXct(time, origin = "1970-01-01", tz = "UTC")) |>
+  arrange(time)
+
+dbDisconnect(con)
+
+glimpse(events)
+
+# Date range covered
+range(events$time)
+
+# Events per type
+count(events, type, sort = TRUE)
+```
+
+### Add the current tab
+
+```{r}
+#| label: add-tab
+#| echo: true
+#| output: false
+
+# Errors don't reliably record where they happened: output_id was always
+# "global" before Sep 12, 2026, and most fatal errors still name a Data
+# output whatever the tab. So we tag every event with the tab the user was
+# on at the time.
+# Tab switches are logged as input events with id "navbar"; the value is
+# the tab name. The starting tab isn't logged, so before the first switch
+# the user is on Data.
+events <- events |>
+  group_by(session) |>
+  mutate(tab = if_else(type == "input" & id == "navbar", value, NA)) |>
+  fill(tab, .direction = "down") |>
+  mutate(tab = coalesce(tab, "Data")) |>
+  ungroup()
+
+count(events, tab, sort = TRUE)
+```
+
+### Remove sessions with no activity
+
+A **user action** is something the user did: changing a setting, clicking a button or link, using a feature, downloading, uploading or loading data. Some events are logged even though the user did nothing, so the code doesn't count them:
+
+- Anything in the first second after a tab opens. Opening a tab sets its default panel and selectors.
+- The species, which is set when a session starts.
+- A burst of dropdowns set to their defaults all at once, while the user is still on Data (see *Where iDEP falls short* › settings).
+- **The Prep scatter plot axes ("Scatter x" and "Scatter y") within 3 seconds of data loading.** iDEP sets them itself when data loads (median 0.7 seconds after). Later changes, mostly on Prep, are the user's and still count.
+
+The Reset button does count. It's a real button that reloads the app, so a reset also starts a new session. Automatic events don't count as the "step before an error" either.
+
+```{r}
+#| label: remove-idle
+#| echo: true
+#| output: false
+
+# Some events fire on their own: the species is set when a session starts,
+# and opening a tab sets its default panel and selectors within a second.
+# A user action is an input, feature use, download, upload, data load or
+# link click more than 1 second after the tab was opened, not counting
+# tab switches. The Reset button (load_data-reset_app_new_data) counts:
+# in iDEP's code it's a real button that reloads the app.
+user_types <- c("input", "feature_used", "download", "file_upload", "data_loaded",
+                "link_click")
+
+events <- events |>
+  group_by(session) |>
+  # Each tab switch starts a new visit; the first visit is on Data
+  mutate(visit = cumsum(row_number() == 1 | (type == "input" & id == "navbar"))) |>
+  group_by(session, visit) |>
+  mutate(user_action = type %in% user_types &
+           !(type == "input" & id == "navbar") &
+           as.numeric(difftime(time, min(time), units = "secs")) > 1) |>
+  ungroup()
+
+# In some sessions the server fills several dropdowns with their default
+# choice at once, while the user is still on Data. These aren't user
+# actions. The burst always sets the Prep heatmap colour to "Green"; any
+# of these inputs logged within a second of that is part of it.
+burst_ids <- c("pre_process-eda_tabs", "pre_process-heat_color_select",
+               "clustering-dist_function", "deg-plot_color_select_1",
+               "deg-plot_color_select", "pathway-pgsea_plot_color_select",
+               "pathway-kegg_color_select")
+burst_times <- events |>
+  filter(type == "input", id == "pre_process-heat_color_select", value == "Green") |>
+  select(session, burst_time = time)
+burst_rows <- events |>
+  mutate(row = row_number()) |>
+  filter(type == "input", id %in% burst_ids) |>
+  inner_join(burst_times, by = "session", relationship = "many-to-many") |>
+  filter(abs(as.numeric(difftime(time, burst_time, units = "secs"))) <= 1) |>
+  pull(row) |>
+  unique()
+burst_was_action <- unique(events$session[burst_rows][events$user_action[burst_rows]])
+
+# iDEP sets the Prep scatter plot axes itself when data loads (median 0.7 s
+# after). Within 3 seconds of a data load they're automatic; later ones are
+# the user changing the axes.
+load_times <- events |>
+  filter(type == "data_loaded") |>
+  select(session, load_time = time)
+scatter_rows <- events |>
+  mutate(row = row_number()) |>
+  filter(type == "feature_used",
+         feature_id %in% c("pre_process-scatter_x", "pre_process-scatter_y")) |>
+  inner_join(load_times, by = "session", relationship = "many-to-many") |>
+  filter(between(as.numeric(difftime(time, load_time, units = "secs")), 0, 3)) |>
+  pull(row) |>
+  unique()
+
+# Automatic events are never user actions, or the step before an error
+events$auto_event <- seq_len(nrow(events)) %in% c(burst_rows, scatter_rows)
+events$user_action[events$auto_event] <- FALSE
+
+# Sessions with no user action at all are left out of the whole report
+idle_sessions <- events |>
+  group_by(session) |>
+  summarise(idle = !any(user_action)) |>
+  filter(idle) |>
+  pull(session)
+
+n_sessions_all <- n_distinct(events$session)
+n_burst_sessions <- n_distinct(burst_times$session)
+burst_idle <- intersect(idle_sessions, burst_was_action)  # idle only because of this rule
+events <- filter(events, !session %in% idle_sessions)
+
+c(all = n_sessions_all, idle = length(idle_sessions), kept = n_distinct(events$session))
+```
+
+### Measure time on each tab
+
+```{r}
+#| label: tab-visits
+#| echo: true
+#| output: false
+
+# One row per tab visit. Time on a tab is the time from each event to the
+# next one. A pause longer than 10 minutes means the user stepped away, so
+# active time counts it as 10 minutes. Logout can come an hour after the
+# last real event, so it isn't counted.
+idle_cap <- 10 * 60  # seconds
+
+visits <- events |>
+  filter(type != "logout") |>
+  group_by(session) |>
+  mutate(gap = coalesce(as.numeric(difftime(lead(time), time, units = "secs")), 0)) |>
+  group_by(session, visit, tab) |>
+  summarise(
+    start       = min(time),
+    secs        = sum(gap),                  # time until the next tab
+    active_secs = sum(pmin(gap, idle_cap)),  # with long pauses capped
+    .groups = "drop"
+  )
+
+summary(visits$secs)
+```
+
+### Group errors into incidents
+
+```{r}
+#| label: error-incidents
+#| echo: true
+#| output: false
+
+# Turn an ID like "pre_process-n_min_samples_count" into
+# "Prep › Number of min samples count": the module prefix becomes the tab
+# name, underscores become spaces, and short forms are spelled out.
+modules <- c(load_data = "Data", pre_process = "Prep", clustering = "Cluster",
+             pca = "PCA", deg = "DEG", pathway = "Pathway", genome = "Genome",
+             bicluster = "Bicluster", network = "Network")
+             
+words <- c(dl = "download", n = "number of", num = "number of", val = "value",
+           go = "GO", kegg = "KEGG", wgcna = "WGCNA", eda = "EDA", ma = "MA",
+           pca = "PCA", png = "PNG", pdf = "PDF", svg = "SVG")
+
+readable <- function(ids) {
+  u <- unique(ids)
+  labels <- vapply(strsplit(u, "-", fixed = TRUE), \(parts) {
+    parts <- vapply(parts, \(p) {
+      if (p %in% names(modules)) return(modules[[p]])
+      w <- strsplit(p, "_", fixed = TRUE)[[1]]
+      known <- tolower(w) %in% names(words)
+      w[known] <- words[tolower(w[known])]
+      s <- paste(w, collapse = " ")
+      paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+    }, "")
+    paste(parts, collapse = " › ")  # ›
+  }, "")
+  unname(labels[match(ids, u)])
+}
+
+# Inputs that switch between panels; their value is the panel opened
+is_panel <- \(id) grepl("(_tabs|_panels|subtab)$|^deg-step_", id)
+
+# Panel names like "sample_tab" -> "Sample tab"
+panel_name <- function(value) {
+  s <- gsub("_", " ", value, fixed = TRUE)
+  paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+}
+
+# A readable label for every user action (NA for other event types)
+events <- events |>
+  mutate(action = case_when(
+    auto_event                       ~ NA,
+    type == "input" & id == "navbar" ~ paste("Opened the", value, "tab"),
+    type == "input" & is_panel(id)   ~ paste0("Switched panel: ", readable(id),
+                                              " → ", panel_name(value)),  # →
+    type == "input" & grepl("button$|submit", id) ~ paste("Clicked:", readable(id)),
+    type == "input"            ~ paste("Changed setting:", readable(id)),
+    type == "feature_used"     ~ paste("Used:", readable(feature_id)),
+    type == "download"         ~ paste("Downloaded:", readable(id)),
+    type == "file_upload"      ~ paste("Uploaded file:", readable(input_id)),
+    type == "data_loaded"      ~ paste0("Data loaded (", source, ")"),
+    type == "link_click"       ~ paste("Clicked link:", link_id),
+    type == "species_selected" ~ "Selected species"
+  ))
+
+count(filter(events, !is.na(action)), action, sort = TRUE)
+
+# One crash logs many error events within a second, sometimes with
+# different messages. Errors in the same session and tab less than
+# 2 seconds apart are one incident. The step is the last action before
+# the incident. The message shown is a fatal one if there is one, and a
+# specific one rather than Shiny's generic message if there is one.
+generic_msg <- "An error has occurred. Check your logs or contact the app author for clarification."
+
+# Until early September the app hid the real message of non-fatal errors
+# and logged only Shiny's generic one. Those are still non-fatal errors,
+# but we don't know what went wrong, so they get their own error type.
+# Fatal errors always have the real message.
+last_generic <- max(events$time[events$type == "error" & events$message %in% generic_msg])
+
+# The DEG ensembl_ID crash stops in early September. Probably fixed, but
+# the data can't confirm it (the app version never changes).
+last_ensembl <- max(events$time[events$type == "error" & events$fatal == "TRUE" &
+                                grepl("ensembl_ID", events$message, fixed = TRUE)])
+days_since_ensembl <- floor(as.numeric(difftime(max(events$time), last_ensembl, units = "days")))
+
+error_incidents <- events |>
+  group_by(session) |>
+  mutate(step = action) |>
+  fill(step, .direction = "down") |>
+  filter(type == "error") |>
+  mutate(
+    gap = as.numeric(difftime(time, lag(time), units = "secs")),
+    incident = cumsum(is.na(gap) | gap > 2 | tab != lag(tab))
+  ) |>
+  group_by(session, incident) |>
+  summarise(
+    time    = min(time),
+    tab     = first(tab),
+    step    = coalesce(first(step), "No action recorded"),
+    message = first(message[order(fatal != "TRUE", message == generic_msg)]),
+    fatal   = if_else(any(fatal == "TRUE"), "Fatal", "Non-fatal"),
+    .groups = "drop"
+  ) |>
+  # Messages can contain line breaks and control characters; flatten them
+  mutate(
+    message    = trimws(gsub("[[:space:][:cntrl:]]+", " ", message)),
+    error_type = case_when(
+      fatal == "Fatal"       ~ "Fatal",
+      message == generic_msg ~ "Non-fatal, generic message",
+      TRUE                   ~ "Non-fatal"
+    )
+  )
+
+count(error_incidents, tab, error_type)
+```
+
+## Initial Insights
+
+::: {.panel-tabset}
+
+### Time of day
+
+#### When are sessions active?
+
+```{r}
+#| label: session-time-of-day
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 8
+#| fig-height: 4
+
+# Median event time for each session, then the hour of day it falls in.
+# Taking the median of the full timestamp (not just the clock time) keeps
+# sessions that cross midnight from landing at noon.
+# Hours are shown in US Central time (handles CDT/CST automatically).
+session_hours <- events |>
+  group_by(session) |>
+  summarise(median_time = median(time)) |>
+  mutate(hour = factor(as.integer(format(median_time, "%H", tz = "America/Chicago")),
+                       levels = 0:23))
+
+ggplot(count(session_hours, hour), aes(hour, n)) +
+  geom_col(fill = "#2a78d6", width = 0.85) +
+  scale_x_discrete(drop = FALSE, labels = sprintf("%02d", 0:23)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "Sessions by median hour of day",
+    subtitle = paste(format(nrow(session_hours), big.mark = ","),
+                     "active sessions; each counted once at its median event time"),
+    x = "Hour of day (US Central time)",
+    y = "Sessions"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: findings-time
+#| include: false
+
+# Helpers for writing numbers in the findings
+num <- \(x) format(x, big.mark = ",", trim = TRUE)
+pct <- \(x, digits = 0) paste0(formatC(x, format = "f", digits = digits), "%")
+mins <- \(x) sprintf("%.1f minutes", x)
+hour_label <- \(h) case_when(h == 0 ~ "midnight", h == 12 ~ "noon",
+                             h < 12 ~ paste(h, "a.m."), TRUE ~ paste(h - 12, "p.m."))
+day_label <- \(x) paste0(format(x, "%a %b ", tz = "America/Chicago"),
+                         as.integer(format(x, "%d", tz = "America/Chicago")))
+
+n_days <- round(as.numeric(difftime(max(events$time), min(events$time), units = "days")))
+
+hour_counts <- session_hours |>
+  count(hour, .drop = FALSE) |>
+  mutate(hour = as.integer(as.character(hour)))
+busiest  <- hour_label(slice_max(hour_counts, n, n = 3, with_ties = FALSE)$hour)
+quietest <- hour_label(slice_min(hour_counts, n, n = 3, with_ties = FALSE)$hour)
+
+# Share of sessions centred between 8 p.m. and 5 a.m. (9 of 24 hours, 38% if even)
+overnight <- 100 * mean(as.integer(as.character(session_hours$hour)) %in% c(20:23, 0:4))
+```
+
+- The data covers `r day_label(min(events$time))` to `r day_label(max(events$time))` (about `r n_days` days) and `r num(n_sessions_all)` sessions. `r num(length(idle_sessions))` of them (`r pct(100 * length(idle_sessions) / n_sessions_all)`) did nothing at all (no clicks, uploads or setting changes) and are left out of this whole report, leaving `r num(nrow(session_hours))` **active sessions**. This chart and the next two subtabs cover all active sessions.
+- The busiest hours are `r knitr::combine_words(busiest)`, and the quietest are `r knitr::combine_words(quietest)` (US Central).
+- `r pct(overnight)` of sessions fall between 8 p.m. and 5 a.m. Central. That suggests many users are in Asia or Europe, but there's no location data to confirm it.
+
+### Session length
+
+#### Do errors shorten sessions?
+
+```{r}
+#| label: session-length-by-error
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 8
+#| fig-height: 4.5
+
+# One row per session: active length in minutes and the worst error it had.
+# Active length adds up the session's tab visits, with long pauses capped
+# and the wait before logout left out (see "Measure time on each tab").
+# A session with any fatal error counts as "Fatal", even if it also had
+# non-fatal errors.
+sessions <- events |>
+  group_by(session) |>
+  summarise(
+    any_error = any(type == "error"),
+    any_fatal = any(type == "error" & fatal == "TRUE")
+  ) |>
+  left_join(visits |>
+              group_by(session) |>
+              summarise(minutes = sum(active_secs) / 60),
+            by = "session") |>
+  mutate(error_group = case_when(
+    any_fatal ~ "Fatal error",
+    any_error ~ "Non-fatal error only",
+    TRUE      ~ "No error"
+  ))
+
+# Session count and median length per group, for the axis labels
+group_stats <- sessions |>
+  group_by(error_group) |>
+  summarise(n = n(), median = median(minutes)) |>
+  mutate(
+    error_group = factor(error_group,
+                         levels = c("No error", "Non-fatal error only", "Fatal error")),
+    label = sprintf("%s\nn = %s · median %.1f min",
+                    error_group, format(n, big.mark = ",", trim = TRUE), median)
+  ) |>
+  arrange(error_group)
+
+sessions <- sessions |>
+  mutate(error_group = factor(error_group, levels = group_stats$error_group))
+
+ggplot(sessions, aes(error_group, minutes)) +
+  geom_boxplot(fill = "#9ec5f4", colour = "#184f95", width = 0.5,
+               outlier.colour = "#2a78d6", outlier.alpha = 0.4, outlier.size = 1.2) +
+  # Log scale: lengths run from seconds to hours
+  scale_y_log10(breaks = c(0.01, 0.1, 1, 10, 100, 1000),
+                labels = c("0.01", "0.1", "1", "10", "100", "1,000")) +
+  scale_x_discrete(labels = setNames(group_stats$label, group_stats$error_group)) +
+  labs(
+    title = "Active session length by error outcome",
+    subtitle = "Sessions with a fatal error are much shorter; the crash ends them",
+    x = NULL,
+    y = "Active session length (minutes, log scale)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: findings-length
+#| include: false
+
+length_q    <- quantile(sessions$minutes, c(0.25, 0.5, 0.75))
+fatal_q75   <- quantile(sessions$minutes[sessions$error_group == "Fatal error"], 0.75)
+group_median <- setNames(group_stats$median, group_stats$error_group)
+```
+
+This covers all active sessions. Session length is active time: pauses longer than 10 minutes count as 10 minutes, and the wait before logout isn't counted.
+
+- The median active session lasts `r mins(length_q[2])` of active time. A quarter of active sessions last under `r mins(length_q[1])`, and a quarter last over `r mins(length_q[3])`.
+- Fatal crashes happen early: 75% of sessions with a fatal error end within `r mins(fatal_q75)` (median `r mins(group_median["Fatal error"])`). The crash is what ends them.
+- Sessions with only non-fatal errors are the longest (median `r mins(group_median["Non-fatal error only"])`). Longer sessions have more chances to hit an error; it doesn't mean errors keep people around.
+
+### Errors
+
+#### Where do errors occur?
+
+This covers all active sessions over the whole period. Each error is placed on the tab the user was on when it happened. One fatal crash usually logs a burst of fatal error events (often 17–19) within about a second, so the error columns count **sessions**, not error events. On each tab, a session is counted as fatal if any of its errors there was fatal, and as non-fatal only otherwise, so the two columns don't overlap. A session can have errors on more than one tab.
+
+Every fatal error records what went wrong. Until `r day_label(last_generic)`, though, the app hid the real message of non-fatal errors and logged only Shiny's generic one ("An error has occurred…"). These still count as non-fatal errors, but are marked **generic message** throughout: we know an error happened and which tab the user was on, but not what went wrong. Until Sep 12 the app also didn't log which part of the app failed; this report places errors by the tab the user was on, so that gap doesn't affect it.
+
+Some bugs also seem to have been fixed during this period. The DEG `ensembl_ID` crash (see below) last happened on `r day_label(last_ensembl)` and not in the `r days_since_ensembl` days since. The data doesn't record app updates, so we can't confirm a fix. The tables count errors over the whole period, so the fatal rates for DEG and Stats include crashes that may no longer happen.
+
+```{r}
+#| label: errors-by-tab
+#| code-fold: true
+#| code-summary: "Show code"
+
+# The ten analysis tabs (Doc and info_we_collect are left out)
+tabs <- c("Data", "Prep", "Cluster", "PCA", "Stats", "DEG",
+          "Pathway", "Genome", "Bicluster", "Network")
+
+# Visits: every time a session enters a tab. The first event of a session
+# counts as entering Data, the starting tab.
+tab_visits <- events |>
+  group_by(session) |>
+  filter(tab != lag(tab, default = "")) |>
+  ungroup() |>
+  count(tab, name = "visits")
+
+# Sessions that spent any time on each tab
+tab_sessions <- events |>
+  distinct(session, tab) |>
+  count(tab, name = "sessions")
+
+# Sessions with a fatal error / only non-fatal errors on each tab.
+# The worst error on the tab decides, so the two groups don't overlap.
+tab_errors <- events |>
+  filter(type == "error") |>
+  group_by(tab, session) |>
+  summarise(any_fatal   = any(fatal == "TRUE"),
+            any_generic = any(message %in% generic_msg),
+            .groups = "drop") |>
+  group_by(tab) |>
+  summarise(
+    sessions_nonfatal = sum(!any_fatal),
+    sessions_generic  = sum(!any_fatal & any_generic),  # part of sessions_nonfatal
+    sessions_fatal    = sum(any_fatal)
+  )
+
+error_table <- tab_visits |>
+  inner_join(tab_sessions, by = "tab") |>
+  left_join(tab_errors, by = "tab") |>
+  filter(tab %in% tabs) |>
+  mutate(
+    across(c(sessions_nonfatal, sessions_generic, sessions_fatal), \(x) coalesce(x, 0L)),
+    pct_nonfatal = 100 * sessions_nonfatal / sessions,
+    pct_fatal    = 100 * sessions_fatal / sessions
+  ) |>
+  select(tab, visits, sessions, sessions_nonfatal, sessions_generic, sessions_fatal,
+         pct_nonfatal, pct_fatal) |>
+  arrange(factor(tab, levels = tabs))  # app order, as in the subtabs below
+
+knitr::kable(
+  error_table,
+  col.names = c("Tab", "Visits", "Sessions on tab", "Sessions with only non-fatal errors",
+                "Of these, generic message", "Sessions with a fatal error",
+                "% non-fatal only", "% fatal"),
+  digits = 1,
+  format.args = list(big.mark = ","),
+  caption = "Traffic and errors by tab, in app order"
+)
+```
+
+```{r}
+#| label: findings-tabs
+#| include: false
+
+n_error_events   <- sum(events$type == "error")
+n_fatal_sessions <- sum(sessions$any_fatal)
+data_fatal       <- error_table$sessions_fatal[error_table$tab == "Data"]
+
+with_pct <- \(d, col) paste0(d$tab, " (", pct(d[[col]], 1), ")")
+top_nonfatal <- with_pct(slice_max(error_table, pct_nonfatal, n = 2, with_ties = FALSE),
+                         "pct_nonfatal")
+
+revisits <- error_table |>
+  mutate(per_session = visits / sessions) |>
+  slice_max(per_session, n = 2, with_ties = FALSE)
+```
+
+- The `r num(n_error_events)` error events form `r num(nrow(error_incidents))` incidents, because one crash logs many events.
+- Most crashes are on Data: `r num(data_fatal)` of the `r num(n_fatal_sessions)` sessions with a fatal error had it there.
+- `r knitr::combine_words(top_nonfatal)` have the highest share of sessions with non-fatal errors.
+- Users go back to tabs often: `r knitr::combine_words(revisits$tab)` get `r sprintf("%.1f", min(revisits$per_session))` or more visits per session.
+
+#### Errors on each tab
+
+Each table lists the step a user took just before the error and the message it produced. An **incident** is one burst of errors: errors in the same session and tab less than 2 seconds apart. When the step is switching panels, the panel opened is shown after the arrow. For errors of type **Non-fatal, generic message**, the real message wasn't logged (see above), so the step is the only clue to what went wrong. It's a guess, not a known cause. Each table shows the 10 most common rows, and the rest can be expanded below it. For a ranked list of the problems still happening, across all tabs, see *Where iDEP falls short*.
+
+**Counts for non-fatal error messages only cover errors after `r day_label(last_generic)`.** Before then, non-fatal errors appear only as generic-message rows, and some of them were probably the same errors listed with a real message. Fatal error messages, and the steps before every error, cover the whole period from `r day_label(min(events$time))`.
+
+```{r}
+#| label: errors-by-step
+#| code-fold: true
+#| code-summary: "Show code"
+#| output: asis
+
+# HTML table so messages with symbols like < or $ display as written.
+# Backticks and $ are written as HTML codes, or the page would read them
+# as code or math and break the table.
+step_table <- function(rows) {
+  table_html <- knitr::kable(
+    rows,
+    format = "html",
+    col.names = c("Step before the error", "Error type", "Error message",
+                  "Incidents", "Sessions"),
+    table.attr = 'class="table table-sm"'
+  )
+  gsub("$", "&#36;", gsub("`", "&#96;", table_html, fixed = TRUE), fixed = TRUE)
+}
+
+cat("::: {.panel-tabset}\n\n")
+
+for (t in tabs) {
+  steps <- error_incidents |>
+    filter(tab == t) |>
+    mutate(message = if_else(error_type == "Non-fatal, generic message",
+                             "Unknown (only Shiny's generic message was logged)", message)) |>
+    group_by(step, error_type, message) |>
+    summarise(incidents = n(), sessions = n_distinct(session), .groups = "drop") |>
+    arrange(desc(incidents), desc(sessions))
+
+  tab_incidents <- filter(error_incidents, tab == t)
+  cat("##### ", t, "\n\n", sep = "")
+  n_inc  <- nrow(tab_incidents)
+  n_sess <- n_distinct(tab_incidents$session)
+  cat(sprintf("%d %s (%d fatal, %d non-fatal, of which %d with a generic message) in %d %s.\n\n",
+              n_inc, if (n_inc == 1) "incident" else "incidents",
+              sum(tab_incidents$fatal == "Fatal"),
+              sum(tab_incidents$fatal == "Non-fatal"),
+              sum(tab_incidents$error_type == "Non-fatal, generic message"),
+              n_sess, if (n_sess == 1) "session" else "sessions"))
+
+  # Stats and DEG share one module in iDEP, so Stats controls are labelled DEG
+  if (t == "Stats") {
+    cat("In iDEP's code, Stats and DEG are one module, so the Stats tab's controls",
+        "have IDs that start with `deg-`. That's why steps here say \"DEG ›\":",
+        "for example, \"Clicked: DEG › Submit model button\" is the Submit model",
+        "button on Stats.\n\n")
+  }
+
+  # The ten most common rows are shown; the rest, mostly one-off
+  # messages, are in a collapsed section below
+  cat(step_table(head(steps, 10)), "\n\n", sep = "")
+  if (nrow(steps) > 10) {
+    cat("<details><summary>Show the other ", nrow(steps) - 10, " rows</summary>\n\n",
+        step_table(tail(steps, -10)), "\n\n</details>\n\n", sep = "")
+  }
+}
+
+cat(":::\n")
+```
+
+```{r}
+#| label: findings-steps
+#| include: false
+
+# Incidents on a tab, optionally only fatal ones or only those whose
+# message or step contains some text
+n_incidents <- function(t, fatal_only = FALSE, msg = NULL, after = NULL) {
+  d <- filter(error_incidents, tab == t)
+  if (fatal_only)      d <- filter(d, fatal == "Fatal")
+  if (!is.null(msg))   d <- filter(d, grepl(msg, message, fixed = TRUE))
+  if (!is.null(after)) d <- filter(d, grepl(after, step, fixed = TRUE))
+  nrow(d)
+}
+
+nonfatal_incidents <- filter(error_incidents, fatal == "Non-fatal")
+n_generic <- sum(nonfatal_incidents$message == generic_msg)
+
+# The most common crash messages on Data. Numbers become "N", so
+# "line 27 did not have 2 elements" and "line 1 did not have 6 elements"
+# count as one message.
+data_crash_msgs <- error_incidents |>
+  filter(tab == "Data", fatal == "Fatal") |>
+  mutate(message = gsub("[0-9]+", "N", sub(" at .*", "", message))) |>
+  count(message, sort = TRUE) |>
+  head(3)
+```
+
+- `r num(n_generic)` of the `r num(nrow(nonfatal_incidents))` non-fatal incidents only have Shiny's generic message, all from `r day_label(last_generic)` or earlier. For those, the step is the only clue.
+- **Data:** `r n_incidents("Data", TRUE, after = "Uploaded file")` of `r n_incidents("Data", TRUE)` crashes come right after a file upload, and another `r n_incidents("Data", TRUE, after = "Data loaded")` right after the data loaded. The top messages are `r knitr::combine_words(paste0('"', data_crash_msgs$message, '" (', data_crash_msgs$n, ")"))`, where N stands for any number. `r n_incidents("Data", TRUE, "invalid multibyte string")` crashes are "invalid multibyte string", and `r n_incidents("Data", TRUE, "<d0><cf>")` of those start with the bytes `<d0><cf>`, which is how an old Excel (.xls) file starts.
+- **PCA:** `r n_incidents("PCA", after = "PCAtools")` of `r n_incidents("PCA")` incidents happen when switching to the PCAtools panel.
+- **DEG:** `r n_incidents("DEG", TRUE, "ensembl_ID")` of `r n_incidents("DEG", TRUE)` crashes are the same `ensembl_ID` join error, `r n_incidents("DEG", TRUE, "ensembl_ID", "Opened the DEG tab")` of them right when the tab opens. The same error causes `r n_incidents("Stats", TRUE, "ensembl_ID")` more crashes on Stats, after clicking Submit model. This is likely one bug, and it seems to have been fixed: it last happened on `r day_label(last_ensembl)`, with none in the `r days_since_ensembl` days since. That's what the data suggests, not a confirmed fix.
+- **Stats:** `r n_incidents("Stats", TRUE, "factorLevel")` of `r n_incidents("Stats", TRUE)` crashes are "object 'factorLevel' not found": `r n_incidents("Stats", TRUE, "factorLevel", "Experiment design")` at Step 1 → Experiment design, and the rest after choosing the model's factors or comparisons.
+- **Network:** `r n_incidents("Network", TRUE, "fewer than 4 genes")` of `r n_incidents("Network", TRUE)` crashes are WGCNA's "too few genes or samples" error.
+
+### How users use iDEP
+
+#### How do people use iDEP, and where does it provide value?
+
+This subtab, *Analysis paths* and *Own data vs. demo* look only at **analysis sessions**: active sessions that loaded data (their own or a demo), since the analysis tabs show nothing without it. A tab counts as used when the user stayed on it for more than 5 seconds; shorter visits are click-throughs. Time is active time: pauses longer than 10 minutes count as 10 minutes, and the wait before logout isn't counted.
+
+```{r}
+#| label: tabs-used
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Sessions that loaded data
+loaded_sessions <- events |>
+  filter(type == "data_loaded") |>
+  distinct(session) |>
+  pull(session)
+
+# Visits longer than 5 seconds to the ten analysis tabs
+used_visits <- visits |>
+  filter(session %in% loaded_sessions, secs > 5, tab %in% tabs)
+
+# Active minutes per session on each tab it used
+session_tab_time <- used_visits |>
+  group_by(session, tab) |>
+  summarise(minutes = sum(active_secs) / 60, .groups = "drop")
+
+tab_use <- session_tab_time |>
+  group_by(tab) |>
+  summarise(
+    pct_sessions = 100 * n() / length(loaded_sessions),
+    median_min   = median(minutes)
+  ) |>
+  mutate(tab = factor(tab, levels = rev(tabs)))  # app order, top to bottom
+
+# Two measures with different scales, so two panels side by side
+tab_use_long <- tab_use |>
+  pivot_longer(c(pct_sessions, median_min), names_to = "measure") |>
+  mutate(
+    label   = if_else(measure == "pct_sessions", sprintf("%.0f%%", value),
+                      sprintf("%.1f min", value)),
+    measure = factor(measure, levels = c("pct_sessions", "median_min"),
+                     labels = c("Share of sessions that used the tab",
+                                "Median active minutes on the tab, per session that used it"))
+  )
+
+ggplot(tab_use_long, aes(value, tab)) +
+  geom_col(fill = "#2a78d6", width = 0.7) +
+  geom_text(aes(label = label), hjust = -0.15, size = 3.4, colour = "#52514e") +
+  facet_wrap(~ measure, scales = "free_x") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(
+    title = "Which tabs sessions use, and how long they stay",
+    subtitle = paste(format(length(loaded_sessions), big.mark = ","),
+                     "analysis sessions (loaded data); a tab counts when the visit lasted over 5 seconds"),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    strip.text = element_text(hjust = 0, face = "bold"),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: session-flow
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Where the average session is, from start (0%) to end (100%) of its active
+# time. At each point, the share of sessions on each tab. The three least
+# used tabs are grouped as "Other tabs".
+flow_tabs <- c(head(tabs, 7), "Other tabs")
+
+progress <- used_visits |>
+  arrange(session, start) |>
+  group_by(session) |>
+  mutate(
+    end_share   = cumsum(active_secs) / sum(active_secs),
+    start_share = lag(end_share, default = 0)
+  ) |>
+  ungroup() |>
+  filter(end_share > start_share)  # drops zero-length visits and empty sessions
+
+points <- tibble(p = seq(0.005, 0.995, by = 0.01))
+
+flow <- progress |>
+  inner_join(points, by = join_by(start_share <= p, end_share > p)) |>
+  mutate(tab = factor(if_else(tab %in% flow_tabs, tab, "Other tabs"), levels = flow_tabs)) |>
+  count(p, tab) |>
+  group_by(p) |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  complete(p, tab, fill = list(n = 0, share = 0))
+
+flow_colours <- c("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4",
+                  "#008300", "#6250d6", "#898781")
+
+ggplot(flow, aes(p, share, fill = tab)) +
+  geom_area(position = position_stack(reverse = TRUE), colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = setNames(flow_colours, flow_tabs), name = NULL) +
+  scale_x_continuous(labels = \(x) paste0(x * 100, "%"), expand = c(0, 0)) +
+  scale_y_continuous(labels = \(x) paste0(x * 100, "%"), expand = c(0, 0)) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title = "How the average session moves through iDEP",
+    subtitle = "Share of sessions on each tab at each point in the session",
+    x = "Point in the session (share of its active time)",
+    y = "Sessions"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: findings-usage
+#| include: false
+
+active_no_data  <- setdiff(unique(events$session), loaded_sessions)
+crashed_no_data <- events |>
+  filter(session %in% active_no_data, type == "error", fatal == "TRUE") |>
+  distinct(session) |>
+  nrow()
+
+tabs_per_session <- count(distinct(used_visits, session, tab), session)$n
+
+# Sessions that used a tab other than Data
+past_data <- unique(used_visits$session[used_visits$tab != "Data"])
+only_data <- 100 * mean(!loaded_sessions %in% past_data)
+
+analysis_use <- tab_use |> filter(tab != "Data") |> arrange(desc(pct_sessions))
+top_tabs    <- with_pct(head(analysis_use, 3), "pct_sessions")
+rare_tabs   <- with_pct(tail(analysis_use, 3), "pct_sessions")
+longest_tab <- slice_max(tab_use, median_min, n = 1, with_ties = FALSE)
+
+# Average share of a session's active time on each tab
+time_share <- session_tab_time |>
+  group_by(session) |>
+  mutate(share = minutes / sum(minutes)) |>
+  ungroup() |>
+  complete(session, tab, fill = list(share = 0)) |>
+  group_by(tab) |>
+  summarise(share = 100 * mean(share)) |>
+  arrange(desc(share))
+
+# Share of sessions on Data halfway through and at the end, and the
+# analysis tabs most common in the last quarter of the session
+data_share <- \(at) 100 * flow$share[flow$tab == "Data" & abs(flow$p - at) < 0.001]
+late_tabs <- flow |>
+  filter(p > 0.75, !tab %in% c("Data", "Other tabs")) |>
+  group_by(tab) |>
+  summarise(share = 100 * mean(share)) |>
+  slice_max(share, n = 2, with_ties = FALSE)
+```
+
+- Of the `r num(n_distinct(events$session))` active sessions, `r num(length(active_no_data))` never loaded data. `r num(crashed_no_data)` of those crashed, mostly while uploading. That leaves `r num(length(loaded_sessions))` analysis sessions (`r pct(100 * length(loaded_sessions) / n_sessions_all)` of all sessions).
+- The median analysis session uses `r median(tabs_per_session)` tabs, counting Data. `r pct(only_data)` never get past Data.
+- The most used analysis tabs are `r knitr::combine_words(top_tabs)`. Almost nobody uses `r knitr::combine_words(rare_tabs)`.
+- On average, `r pct(time_share$share[time_share$tab == "Data"])` of a session's active time is spent on Data. Of the analysis tabs, the most time goes to `r knitr::combine_words(head(filter(time_share, tab != "Data")$tab, 2))`.
+- `r as.character(longest_tab$tab)` has the longest stays: a median of `r mins(longest_tab$median_min)` per session that uses it.
+- Every session starts on Data. Halfway through, `r pct(data_share(0.505))` are still there, and at the end `r pct(data_share(0.995))`, partly because of the sessions that never leave it. In the last quarter of the session, the most common analysis tabs are `r knitr::combine_words(with_pct(late_tabs, "share"))`.
+
+#### Who never gets past Data?
+
+These are analysis sessions that never stayed more than 5 seconds on any tab other than Data. The table compares them with the analysis sessions that went on.
+
+```{r}
+#| label: data-only
+#| code-fold: true
+#| code-summary: "Show code"
+
+# One row per session that loaded data, with what it looked like
+session_profile <- events |>
+  filter(session %in% loaded_sessions) |>
+  group_by(session) |>
+  summarise(
+    source      = first(na.omit(source)),         # upload or demo
+    groups      = first(na.omit(groups_bucket)),  # number of sample groups
+    crashed     = any(type == "error" & fatal == "TRUE"),
+    clicked_tab = any(type == "input" & id == "navbar"),
+    downloads   = sum(type == "download" & user_action),
+    # Minutes from the first data load to the last real event
+    after_load  = as.numeric(difftime(max(time[type != "logout"]),
+                                      min(time[type == "data_loaded"]), units = "mins"))
+  ) |>
+  left_join(visits |>
+              group_by(session) |>
+              summarise(active_min = sum(active_secs) / 60),
+            by = "session") |>
+  left_join(count(distinct(used_visits, session, tab), session, name = "n_tabs"),
+            by = "session") |>
+  mutate(past_data = session %in% past_data)
+
+# A side-by-side summary of two groups of sessions; `group` is a
+# column of session_profile
+profile_table <- function(profiles, group) {
+  profiles |>
+    group_by(Group = .data[[group]]) |>
+    summarise(
+      "Sessions"                         = num(n()),
+      "Used the demo data"               = pct(100 * mean(source == "demo", na.rm = TRUE)),
+      "Data has only one sample group"   = pct(100 * mean(groups == "1", na.rm = TRUE)),
+      "Crashed"                          = pct(100 * mean(crashed)),
+      "Clicked another tab at all"       = pct(100 * mean(clicked_tab)),
+      "Downloaded something"             = pct(100 * mean(downloads > 0)),
+      "Median tabs used"                 = as.character(median(n_tabs, na.rm = TRUE)),
+      "Median active minutes"            = sprintf("%.1f", median(active_min, na.rm = TRUE)),
+      "Median minutes after data loaded" = sprintf("%.1f", median(after_load))
+    ) |>
+    pivot_longer(-Group, names_to = "Measure") |>
+    pivot_wider(names_from = Group, values_from = value)
+}
+
+session_profile |>
+  mutate(group = if_else(past_data, "Went on to other tabs", "Never past Data")) |>
+  profile_table("group") |>
+  select(Measure, `Never past Data`, `Went on to other tabs`) |>
+  knitr::kable(align = "lrr", caption = "Analysis sessions, by whether they got past Data")
+```
+
+```{r}
+#| label: findings-data-only
+#| include: false
+
+stuck <- filter(session_profile, !past_data)
+went_on <- filter(session_profile, past_data)
+share <- \(x) pct(100 * mean(x, na.rm = TRUE))
+
+# The step before the crash, for crashes in sessions that never got past Data
+stuck_crash_steps <- error_incidents |>
+  filter(session %in% stuck$session, fatal == "Fatal") |>
+  distinct(session, .keep_all = TRUE) |>
+  count(step, sort = TRUE)
+```
+
+- `r num(nrow(stuck))` analysis sessions (`r pct(only_data)`) never get past Data, and `r share(stuck$downloads > 0)` of them download anything.
+- `r share(stuck$crashed)` of them crashed, compared with `r share(went_on$crashed)` of the sessions that went on. The most common step before the crash is "`r stuck_crash_steps$step[1]`" (`r stuck_crash_steps$n[1]` sessions).
+- Most leave almost right away: half end within `r mins(median(stuck$after_load))` of the data loading, and `r share(!stuck$clicked_tab)` never even click another tab. That points to users who didn't know what to do next, or whose data didn't look right, rather than users who were finished.
+- `r share(stuck$groups == "1")` have data with only one sample group, compared with `r share(went_on$groups == "1")` of the sessions that went on. With one group, there's nothing for Stats and DEG to compare.
+- `r share(stuck$source == "demo")` used the demo data, compared with `r share(went_on$source == "demo")`. Some of these users were only trying iDEP out.
+
+#### Which features do people use most, and which does almost nobody use?
+
+#### Which downloads (figures, reports, data tables) are most popular?
+
+#### What does a successful session look like, and what share of sessions get there?
+
+A **successful session** is an analysis session that downloads at least one thing (a figure, report or data table), the clearest sign the user got something they'll use.
+
+```{r}
+#| label: successful-sessions
+#| code-fold: true
+#| code-summary: "Show code"
+
+session_profile <- session_profile |>
+  mutate(outcome = if_else(downloads > 0, "Successful", "No download"))
+
+profile_table(session_profile, "outcome") |>
+  select(Measure, Successful, `No download`) |>
+  knitr::kable(align = "lrr", caption = "Analysis sessions, by whether they downloaded anything")
+```
+
+```{r}
+#| label: successful-tabs
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Share of each group's sessions that used each tab. Data is left out,
+# because every session uses it.
+outcome_levels <- c("Successful", "No download")
+
+success_tabs <- used_visits |>
+  distinct(session, tab) |>
+  inner_join(select(session_profile, session, outcome), by = "session") |>
+  count(outcome, tab) |>
+  left_join(count(session_profile, outcome, name = "total"), by = "outcome") |>
+  mutate(
+    pct     = 100 * n / total,
+    tab     = factor(tab, levels = rev(tabs)),
+    outcome = factor(outcome, levels = rev(outcome_levels))  # Successful on top
+  ) |>
+  filter(tab != "Data")
+
+ggplot(success_tabs, aes(pct, tab, fill = outcome)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.0f%%", pct), group = outcome),
+            position = position_dodge(width = 0.8), hjust = -0.15,
+            size = 3.2, colour = "#52514e") +
+  scale_fill_manual(values = c(Successful = "#2a78d6", "No download" = "#b5b3ad"),
+                    breaks = outcome_levels, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Successful sessions use more of iDEP",
+    subtitle = "Share of sessions that used each tab for more than 5 seconds",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: top-downloads
+#| code-fold: true
+#| code-summary: "Show code"
+
+downloads <- events |>
+  filter(session %in% loaded_sessions, type == "download", user_action) |>
+  mutate(download = sub("^Downloaded: ", "", action))
+
+downloads |>
+  group_by(download) |>
+  summarise(sessions = n_distinct(session), downloads = n()) |>
+  arrange(desc(sessions), desc(downloads)) |>
+  head(10) |>
+  knitr::kable(col.names = c("Download", "Sessions", "Downloads"),
+               format.args = list(big.mark = ","),
+               caption = "The ten downloads used by the most sessions")
+```
+
+```{r}
+#| label: findings-success
+#| include: false
+
+successful <- filter(session_profile, outcome == "Successful")
+no_dl      <- filter(session_profile, outcome == "No download")
+
+# The tabs with the biggest gap in use between the two groups
+tab_gap <- success_tabs |>
+  select(tab, outcome, pct) |>
+  pivot_wider(names_from = outcome, values_from = pct, values_fill = 0) |>
+  mutate(gap = Successful - `No download`) |>
+  slice_max(gap, n = 2, with_ties = FALSE)
+
+top_downloads <- downloads |>
+  group_by(download) |>
+  summarise(sessions = n_distinct(session)) |>
+  slice_max(sessions, n = 3, with_ties = FALSE)
+```
+
+- `r num(nrow(successful))` sessions are successful: `r pct(100 * nrow(successful) / length(loaded_sessions))` of analysis sessions, or `r pct(100 * nrow(successful) / n_sessions_all)` of all sessions.
+- Successful sessions use a median of `r median(successful$n_tabs)` tabs and `r mins(median(successful$active_min))` of active time, compared with `r median(no_dl$n_tabs, na.rm = TRUE)` tabs and `r mins(median(no_dl$active_min, na.rm = TRUE))` for analysis sessions with no download.
+- The biggest differences are on `r knitr::combine_words(paste0(tab_gap$tab, " (", pct(tab_gap$Successful), " vs. ", pct(tab_gap$"No download"), ")"))`. A successful session usually gets through to the comparison results.
+- Demo users rarely download: `r share(successful$source == "demo")` of successful sessions used the demo data, compared with `r share(no_dl$source == "demo")` of analysis sessions with no download.
+- A successful session downloads a median of `r median(successful$downloads)` things. The downloads used by the most sessions are `r knitr::combine_words(paste0('"', top_downloads$download, '" (', top_downloads$sessions, " sessions)"))`.
+
+### Analysis paths
+
+#### Which sequences of tabs are most common? Do they match how we expect iDEP to be used?
+
+This follows the successful sessions (analysis sessions with at least one download) through the whole session. A path lists the tabs a session used for more than 5 seconds, in the order it first reached them. Going back to a tab isn't counted again; users go back and forth a lot, and almost every path would be different.
+
+```{r}
+#| label: success-paths
+#| code-fold: true
+#| code-summary: "Show code"
+
+# One path per successful session, e.g. "Data → Prep → Stats"
+success_paths <- used_visits |>
+  filter(session %in% successful$session) |>
+  arrange(session, start) |>
+  group_by(session) |>
+  filter(!duplicated(tab)) |>  # first visit to each tab only
+  summarise(path = paste(tab, collapse = " → "))
+
+top_paths <- success_paths |>
+  count(path, sort = TRUE, name = "sessions") |>
+  mutate(pct = 100 * sessions / nrow(success_paths)) |>
+  head(5)
+
+knitr::kable(
+  top_paths,
+  col.names = c("Path", "Sessions", "% of all successful sessions"),
+  digits = 1,
+  format.args = list(big.mark = ","),
+  caption = paste0("The five most common paths, out of all ",
+                   num(nrow(success_paths)), " successful sessions")
+)
+```
+
+```{r}
+#| label: findings-paths
+#| include: false
+
+n_paths <- n_distinct(success_paths$path)
+
+# The tab each successful session's first download came from
+first_dl_tab <- downloads |>
+  group_by(session) |>
+  slice_min(time, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  count(tab, sort = TRUE) |>
+  mutate(pct = 100 * n / sum(n))
+```
+
+- Successful sessions take `r num(n_paths)` different paths. The five most common cover only `r pct(sum(top_paths$pct))` of them.
+- The most common path is `r top_paths$path[1]` (`r pct(top_paths$pct[1], 1)`). The full workflow in app order and the shortcut from Data straight to Stats and DEG are both common.
+- The first download is most often on `r knitr::combine_words(with_pct(head(first_dl_tab, 3), "pct"))`. Many users download an early Prep or Cluster figure and keep going, so the paths follow the whole session, not just up to the first download.
+
+#### Why do sessions end on a given tab? Are users finished, or are they stuck?
+
+This covers analysis sessions. A session's last tab is the last one where the user did something or stayed more than 15 seconds; tabs clicked through on the way out don't count. A tab where the session crashed also counts, since some crashes come right as a tab opens. Each session gets one ending, checked in this order:
+
+- **Crashed:** the session had a fatal error.
+- **Downloaded something:** likely finished, even if they then reset the app to load new data.
+- **Started over:** the last action was resetting the app to load new data, without downloading anything first. Loading new data starts a new session, so these users likely carried on there.
+- **Error, no download:** a non-fatal error on the last tab and no download. Likely stuck.
+- **Left without a download:** unclear. The user may have read the results and been done, or given up; the data can't tell.
+
+```{r}
+#| label: session-endings
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# For each tab visit: did the user do anything, did the session crash there,
+# and how long it lasted
+visit_info <- events |>
+  filter(session %in% loaded_sessions) |>
+  group_by(session, visit) |>
+  summarise(
+    acted        = any(user_action),
+    crashed_here = any(type == "error" & fatal == "TRUE"),
+    error_here   = any(type == "error" & fatal != "TRUE"),
+    .groups = "drop"
+  ) |>
+  inner_join(select(visits, session, visit, tab, secs), by = c("session", "visit"))
+
+# The last visit that had an action, lasted over 15 seconds or crashed
+last_visit <- visit_info |>
+  filter(acted | secs > 15 | crashed_here) |>
+  group_by(session) |>
+  slice_max(visit, n = 1) |>
+  ungroup()
+
+# The session's last user action
+last_action <- events |>
+  filter(session %in% loaded_sessions, user_action) |>
+  group_by(session) |>
+  slice_max(time, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(session, last_id = id, last_label = action)
+
+ending_levels <- c("Downloaded something", "Started over", "Left without a download",
+                   "Error, no download", "Crashed")
+
+endings <- last_visit |>
+  left_join(select(session_profile, session, crashed, downloads), by = "session") |>
+  left_join(last_action, by = "session") |>
+  mutate(ending = factor(case_when(
+    crashed                                       ~ "Crashed",
+    downloads > 0                                 ~ "Downloaded something",
+    last_id %in% "load_data-reset_app_new_data"   ~ "Started over",
+    error_here                                    ~ "Error, no download",
+    TRUE                                          ~ "Left without a download"
+  ), levels = ending_levels))
+
+# The seven main tabs in app order; the rest are grouped as "Other tabs"
+end_tabs <- c(head(tabs, 7), "Other tabs")
+
+end_shares <- endings |>
+  mutate(tab = if_else(tab %in% end_tabs, tab, "Other tabs")) |>
+  count(tab, ending) |>
+  group_by(tab) |>
+  mutate(share = n / sum(n), total = sum(n)) |>
+  ungroup() |>
+  mutate(tab_label = factor(sprintf("%s (%s)", tab, num(total)),
+                            levels = rev(sprintf("%s (%s)", end_tabs,
+                                                 num(total[match(end_tabs, tab)])))))
+
+ending_colours <- c("Downloaded something"    = "#2a78d6",
+                    "Started over"            = "#1baf7a",
+                    "Left without a download" = "#b5b3ad",
+                    "Error, no download"      = "#eda100",
+                    "Crashed"                 = "#eb6834")
+
+ggplot(end_shares, aes(share, tab_label, fill = ending)) +
+  geom_col(position = position_stack(reverse = TRUE), width = 0.75,
+           colour = "white", linewidth = 0.4) +
+  # Label only segments wide enough to hold the number
+  geom_text(aes(label = if_else(share >= 0.06, sprintf("%.0f%%", 100 * share), ""),
+                colour = ending == "Left without a download", group = ending),
+            position = position_stack(vjust = 0.5, reverse = TRUE), size = 3.2) +
+  scale_colour_manual(values = c(`TRUE` = "#2b2a28", `FALSE` = "white"), guide = "none") +
+  scale_fill_manual(values = ending_colours, breaks = ending_levels, name = NULL) +
+  scale_x_continuous(expand = c(0, 0)) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title = "How sessions end on each tab",
+    subtitle = "Analysis sessions, by the last tab they used (sessions ending there)",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: findings-endings
+#| include: false
+
+end_overall <- endings |>
+  count(ending) |>
+  mutate(pct = 100 * n / sum(n))
+end_pct <- \(e) pct(end_overall$pct[end_overall$ending == e])
+
+top_end_tabs <- endings |>
+  count(tab, sort = TRUE) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  head(3)
+
+started_data <- with(endings, sum(ending == "Started over" & tab == "Data"))
+
+# The most common last action of sessions that left without a download,
+# on the main analysis tabs
+unclear_last <- endings |>
+  filter(ending == "Left without a download", tab %in% c("Stats", "Cluster", "Pathway")) |>
+  count(tab, last_label) |>
+  group_by(tab) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  slice_max(n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(tab = factor(tab, levels = tabs)) |>
+  arrange(tab)
+
+crash_tab <- end_shares |>
+  filter(ending == "Crashed") |>
+  slice_max(share, n = 1, with_ties = FALSE)
+```
+
+- `r knitr::combine_words(with_pct(top_end_tabs, "pct"))` are the most common last tabs.
+- `r end_pct("Downloaded something")` of analysis sessions downloaded something, and `r end_pct("Started over")` started over to load new data without downloading anything (`r num(started_data)` of them from Data). Starting over is the most common way a session ends on Data, so many sessions that end there aren't stuck.
+- `r end_pct("Left without a download")` left without a download. On the analysis tabs, these sessions often end right after running an analysis: the most common last action is `r knitr::combine_words(paste0('"', sub("^Clicked: ", "", unclear_last$last_label), '" on ', unclear_last$tab, " (", pct(unclear_last$pct), ")"))`. They may have read the results and been done, or the results may not have been what they needed.
+- Few sessions are clearly stuck: `r end_pct("Error, no download")` ended on an error without downloading, and `r end_pct("Crashed")` crashed. `r crash_tab$tab` has the highest share of sessions ending in a crash (`r pct(100 * crash_tab$share)`).
+
+### Own data vs. demo
+
+#### Do users who bring their own data behave differently from those who only try the demo data?
+
+This compares analysis sessions by where the data came from: iDEP's demo data, or the user's own upload. A user who tries the demo and then uploads their own data shows up as two sessions, because loading new data starts a new session, so the two groups can't be fully separated.
+
+```{r}
+#| label: demo-profile
+#| code-fold: true
+#| code-summary: "Show code"
+
+session_profile <- session_profile |>
+  mutate(data_source = if_else(source == "demo", "Demo data", "Own data"))
+
+# The demo data has no sample-group count, and the demo row would be 100%
+# vs. 0%, so those two measures are left out
+profile_table(session_profile, "data_source") |>
+  filter(!Measure %in% c("Used the demo data", "Data has only one sample group")) |>
+  select(Measure, `Own data`, `Demo data`) |>
+  knitr::kable(align = "lrr", caption = "Analysis sessions, by where the data came from")
+```
+
+```{r}
+#| label: demo-flow
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 10
+#| fig-height: 4.5
+
+# The session-flow chart from "How users use iDEP", one panel per group
+flow_source <- progress |>
+  inner_join(points, by = join_by(start_share <= p, end_share > p)) |>
+  inner_join(select(session_profile, session, data_source), by = "session") |>
+  mutate(tab = factor(if_else(tab %in% flow_tabs, tab, "Other tabs"), levels = flow_tabs)) |>
+  count(data_source, p, tab) |>
+  group_by(data_source, p) |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  complete(data_source, p, tab, fill = list(n = 0, share = 0))
+
+source_n <- count(session_profile, data_source)
+source_labels <- setNames(sprintf("%s (%s sessions)", source_n$data_source, num(source_n$n)),
+                          source_n$data_source)
+
+ggplot(flow_source, aes(p, share, fill = tab)) +
+  geom_area(position = position_stack(reverse = TRUE), colour = "white", linewidth = 0.3) +
+  facet_wrap(~ factor(data_source, levels = c("Own data", "Demo data")),
+             labeller = as_labeller(source_labels)) +
+  scale_fill_manual(values = setNames(flow_colours, flow_tabs), name = NULL) +
+  scale_x_continuous(labels = \(x) paste0(x * 100, "%"), expand = c(0, 0)) +
+  scale_y_continuous(labels = \(x) paste0(x * 100, "%"), expand = c(0, 0)) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title = "How sessions move through iDEP, own data vs. demo data",
+    subtitle = "Share of sessions on each tab at each point in the session",
+    x = "Point in the session (share of its active time)",
+    y = "Sessions"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    panel.spacing = unit(1.5, "lines"),
+    legend.position = "top",
+    legend.justification = "left",
+    strip.text = element_text(hjust = 0, face = "bold"),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: demo-downloads
+#| code-fold: true
+#| code-summary: "Show code"
+
+# The five downloads used by the most sessions in each group
+source_downloads <- downloads |>
+  select(-source) |>  # `source` here is the data_loaded column, empty for downloads
+  inner_join(select(session_profile, session, data_source), by = "session")
+
+top_dl_source <- source_downloads |>
+  group_by(data_source, download) |>
+  summarise(sessions = n_distinct(session), .groups = "drop") |>
+  group_by(data_source) |>
+  slice_max(sessions, n = 5, with_ties = FALSE) |>
+  mutate(rank = row_number(), cell = paste0(download, " (", num(sessions), ")")) |>
+  ungroup() |>
+  select(rank, data_source, cell) |>
+  pivot_wider(names_from = data_source, values_from = cell)
+
+knitr::kable(
+  select(top_dl_source, rank, `Own data`, `Demo data`),
+  col.names = c("", "Own data", "Demo data"),
+  caption = "The five downloads used by the most sessions in each group (sessions in brackets)"
+)
+```
+
+```{r}
+#| label: findings-demo
+#| include: false
+
+demo <- filter(session_profile, data_source == "Demo data")
+own  <- filter(session_profile, data_source == "Own data")
+
+# Share of each group's downloads that are reports
+report_share <- source_downloads |>
+  group_by(data_source) |>
+  summarise(pct = 100 * mean(grepl("Report", download)))
+report_pct <- \(s) pct(report_share$pct[report_share$data_source == s])
+
+# Share of each group's sessions on Data halfway through the session
+data_half <- \(s) 100 * flow_source$share[flow_source$data_source == s &
+                                          flow_source$tab == "Data" &
+                                          abs(flow_source$p - 0.505) < 0.001]
+```
+
+- `r num(nrow(demo))` sessions (`r pct(100 * nrow(demo) / length(loaded_sessions))` of analysis sessions) used the demo data, so the demo numbers are less certain.
+- Demo users download much less: `r share(demo$downloads > 0)` downloaded anything, compared with `r share(own$downloads > 0)` of own-data users, and they average `r sprintf("%.1f", mean(demo$downloads))` downloads per session against `r sprintf("%.1f", mean(own$downloads))`.
+- They download different things. `r report_pct("Demo data")` of demo users' downloads are reports, compared with `r report_pct("Own data")` for own-data users, who mostly take data tables like significant genes and fold changes. Demo users are looking at what iDEP produces; own-data users are taking results away.
+- Demo users go less far: `r share(!demo$past_data)` never get past Data, compared with `r share(!own$past_data)`. Halfway through a session, `r pct(data_half("Demo data"))` of demo sessions are still on Data, compared with `r pct(data_half("Own data"))`. Those that go on follow roughly the same route, with relatively more time on Prep, Cluster and PCA and less on Stats.
+- `r share(demo$crashed)` of demo sessions crashed, compared with `r share(own$crashed)` of own-data sessions. The demo files are known to work, so this fits with crashes coming from uploaded files.
+
+### Where iDEP falls short
+
+#### Where does iDEP fall short?
+
+This lists the problems users hit most often, across all tabs. It covers only **sessions since `r day_label(last_generic)`**: active sessions that started after the day every error began to record what went wrong, so bugs that stopped before then (like the DEG `ensembl_ID` crash) aren't counted. Messages that differ only in numbers count as one problem (any number is shown as N), and problems are ranked by the number of sessions they affected. **Downloaded afterwards** is the share of affected sessions that still downloaded something after the error: a low share means the error blocked users, a high share means they worked around it. A crash ends the session, so this column is blank for fatal problems.
+
+```{r}
+#| label: top-problems
+#| code-fold: true
+#| code-summary: "Show code"
+
+# Sessions that started after the last generic error, when every error
+# records its real message
+recent_sessions <- events |>
+  group_by(session) |>
+  summarise(start = min(time)) |>
+  filter(start > last_generic) |>
+  pull(session)
+
+recent_incidents <- error_incidents |>
+  filter(session %in% recent_sessions) |>
+  mutate(problem = gsub("[0-9]+", "N", message))
+
+# Did the session download anything after its first incident of the problem?
+first_hit <- recent_incidents |>
+  group_by(problem, fatal, session) |>
+  summarise(time = min(time), .groups = "drop") |>
+  left_join(downloads |>
+              group_by(session) |>
+              summarise(last_dl = max(time)),
+            by = "session") |>
+  mutate(dl_after = coalesce(last_dl > time, FALSE))
+
+# Tabs where a problem happened, most sessions first, e.g. "PCA (210), DEG (3)"
+where <- \(tab, session) {
+  n <- sort(tapply(session, tab, n_distinct), decreasing = TRUE)
+  paste0(names(n), " (", n, ")", collapse = ", ")
+}
+
+problems <- recent_incidents |>
+  group_by(problem, fatal) |>
+  summarise(
+    where     = where(tab, session),
+    step_pct  = 100 * max(table(step)) / n(),
+    top_step  = names(which.max(table(step))),
+    sessions  = n_distinct(session),
+    incidents = n(),
+    .groups = "drop"
+  ) |>
+  left_join(first_hit |>
+              group_by(problem, fatal) |>
+              summarise(dl_after = 100 * mean(dl_after), .groups = "drop"),
+            by = c("problem", "fatal")) |>
+  mutate(
+    step     = sprintf("%s (%.0f%%)", top_step, step_pct),
+    dl_after = if_else(fatal == "Fatal", "", pct(dl_after))
+  ) |>
+  arrange(desc(sessions), desc(incidents))
+
+top_problems <- head(problems, 15)
+
+# HTML table, with backticks and $ written as HTML codes (see errors-by-step)
+problems_html <- knitr::kable(
+  select(top_problems, problem, fatal, where, step, sessions, incidents, dl_after),
+  format = "html",
+  col.names = c("Error message", "Type", "Tab (sessions)",
+                "Most common step before it", "Sessions", "Incidents",
+                "Downloaded afterwards"),
+  format.args = list(big.mark = ","),
+  caption = paste0("The 15 problems that affected the most sessions, out of ",
+                   nrow(problems), " (sessions since ",
+                   day_label(last_generic), ")"),
+  table.attr = 'class="table table-sm"'
+)
+knitr::asis_output(gsub("$", "&#36;", gsub("`", "&#96;", problems_html, fixed = TRUE),
+                        fixed = TRUE))
+```
+
+```{r}
+#| label: findings-shortfalls
+#| include: false
+
+recent_error_sessions <- n_distinct(recent_incidents$session)
+top10_sessions <- recent_incidents |>
+  semi_join(head(problems, 10), by = c("problem", "fatal")) |>
+  distinct(session) |>
+  nrow()
+
+# Crashes on Data right after a file upload
+recent_fatal   <- filter(recent_incidents, fatal == "Fatal")
+upload_crashes <- recent_fatal |>
+  filter(tab == "Data", grepl("Uploaded file", step, fixed = TRUE)) |>
+  distinct(session) |>
+  nrow()
+
+# Non-fatal problems among the top 15 that users most and least often
+# work around (downloaded afterwards)
+recover <- first_hit |>
+  semi_join(filter(top_problems, fatal == "Non-fatal"), by = c("problem", "fatal")) |>
+  group_by(problem) |>
+  summarise(dl_after = 100 * mean(dl_after)) |>
+  left_join(select(filter(top_problems, fatal == "Non-fatal"), problem, top_step), by = "problem") |>
+  arrange(dl_after)
+
+# Messages in the bullets need the same HTML codes as the tables
+esc <- \(x) gsub("$", "&#36;", gsub("`", "&#96;", x, fixed = TRUE), fixed = TRUE)
+```
+
+- `r num(recent_error_sessions)` of the `r num(length(recent_sessions))` sessions since `r day_label(last_generic)` (`r pct(100 * recent_error_sessions / length(recent_sessions))`) hit at least one error. There are `r nrow(problems)` different problems, but the 10 most common account for `r pct(100 * top10_sessions / recent_error_sessions)` of these sessions, so fixing a handful of bugs would help most users who run into errors.
+- `r num(upload_crashes)` of the `r num(n_distinct(recent_fatal$session))` of these sessions that crashed did so on Data right after uploading a file. iDEP can't read these files, and the session crashes instead of telling the user what's wrong with them.
+- Some errors stop users; others they work around. After "`r esc(recover$problem[1])`" (most often after "`r recover$top_step[1]`"), only `r pct(recover$dl_after[1])` of sessions downloaded anything afterwards. After "`r esc(recover$problem[nrow(recover)])`" (most often after "`r recover$top_step[nrow(recover)]`"), `r pct(recover$dl_after[nrow(recover)])` did.
+- Not every shortfall is an error. `r pct(only_data)` of analysis sessions never get past Data (see *How users use iDEP*), and `r end_pct("Left without a download")` leave without downloading anything (see *Analysis paths*).
+
+#### Are there settings that users keep changing away from our defaults?
+
+This lists the settings users change most, among analysis sessions. The defaults come from iDEP's source code (version 2.4.4). The app only logs a setting when it changes, and typing a number logs every keystroke (typing 0.05 logs 0, then 0.05), so each session counts by the **last value** it set: a session changed a setting if it ended on something other than the default. The share is out of the sessions that used the setting's tab. Some settings only appear after another choice (for example, the number of clusters only shows for k-means), so their share understates how often people who see them change them.
+
+In `r num(n_burst_sessions)` sessions, the app sets several dropdowns (heatmap colors, the distance measure, the Prep panel) to their defaults all at once while the user is still on Data. That's the app, not the user, so those events aren't counted as changes here, or as user actions anywhere in this report. This moved `r num(length(burst_idle))` sessions from active to idle (did nothing).
+
+```{r}
+#| label: settings-changed
+#| code-fold: true
+#| code-summary: "Show code"
+
+# Settings with a fixed default in the iDEP 2.4.4 source. Left out: the
+# file format and gene-set database (no default; users must pick one),
+# the enrichment background (set from the data) and the ID-conversion
+# box (set by the species choice).
+settings <- tribble(
+  ~id,                                ~setting,                             ~default,
+  "load_data-heatmap_color_select",   "Heatmap colors",                     "Green-Black-Red",
+  "pre_process-counts_transform",     "Transform for read counts",          "1",
+  "pre_process-min_counts",           "Min. CPM",                           "0.5",
+  "pre_process-n_min_samples_count",  "Min. number of libraries",           "1",
+  "pre_process-missing_value",        "Missing values",                     "geneMedian",
+  "pre_process-heat_color_select",    "Heatmap colors",                     "Green",
+  "clustering-cluster_meth",          "Clustering method",                  "1",
+  "clustering-n_genes",               "Number of top genes",                "1000",
+  "clustering-dendrogram_display",    "Dendrogram",                         "row",
+  "clustering-k_clusters",            "Number of clusters (k-means)",       "6",
+  "clustering-dist_function",         "Distance measure",                   "1",
+  "pca-encircle",                     "Encircle groups",                    "0",
+  "deg-limma_p_val",                  "FDR cutoff",                         "0.1",
+  "deg-limma_fc",                     "Min. fold-change",                   "2",
+  "deg-plot_color_select_1",          "Plot colors",                        "Green-Red",
+  "deg-plot_color_select",            "Plot colors",                        "Green-Red",
+  "deg-gene_direction_filter",        "Gene direction",                     "Up-regulated genes",
+  "deg-label_volcano-num_genes",      "Volcano plot: label top n genes",    "5",
+  "pathway-pathway_method",           "Pathway analysis method",            "3",
+  "pathway-pathway_p_val_cutoff",     "Pathway significance cutoff (FDR)",  "0.1",
+  "pathway-pgsea_plot_color_select",  "PGSEA plot colors",                  "Blue-Red",
+  "pathway-kegg_color_select",        "KEGG colors (low-high)",             "Green-Red"
+)
+
+# Settings whose logged value is a code, with the label shown in the app
+choice_labels <- tribble(
+  ~id,                              ~value,              ~label,
+  "pre_process-counts_transform",   "1",                 "edgeR: log-CPM",
+  "pre_process-counts_transform",   "2",                 "VST",
+  "pre_process-counts_transform",   "3",                 "rlog",
+  "pre_process-missing_value",      "geneMedian",        "Use gene median",
+  "pre_process-missing_value",      "treatAsZero",       "Treat as zero",
+  "pre_process-missing_value",      "geneMedianInGroup", "Use gene median in group",
+  "clustering-cluster_meth",        "1",                 "Hierarchical",
+  "clustering-cluster_meth",        "2",                 "k-Means",
+  "clustering-dendrogram_display",  "row",               "Row",
+  "clustering-dendrogram_display",  "column",            "Column",
+  "clustering-dendrogram_display",  "both",              "Both",
+  "clustering-dendrogram_display",  "none",              "None",
+  "clustering-dist_function",       "1",                 "Pearson",
+  "clustering-dist_function",       "2",                 "Euclidean",
+  "clustering-dist_function",       "3",                 "Absolute Pearson",
+  "pca-encircle",                   "0",                 "Off",
+  "pca-encircle",                   "1",                 "On",
+  "pathway-pathway_method",         "1",                 "GAGE",
+  "pathway-pathway_method",         "2",                 "PGSEA",
+  "pathway-pathway_method",         "3",                 "GSEA (preranked fgsea)",
+  "pathway-pathway_method",         "4",                 "PGSEA w/ all samples",
+  "pathway-pathway_method",         "5",                 "ReactomePA",
+  "pathway-pathway_method",         "6",                 "GSVA",
+  "pathway-pathway_method",         "7",                 "ssGSEA",
+  "pathway-pathway_method",         "8",                 "PLAGE"
+)
+choice_label <- \(id, value) {
+  coalesce(choice_labels$label[match(paste(id, value), paste(choice_labels$id, choice_labels$value))],
+           value)
+}
+
+# Each session's last value of each setting. Numbers are compared as
+# numbers, so 0.10 counts as the default 0.1.
+last_values <- events |>
+  filter(session %in% loaded_sessions, type == "input", user_action,
+         id %in% settings$id, !is.na(value)) |>
+  group_by(id, session) |>
+  slice_max(time, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  inner_join(settings, by = "id") |>
+  mutate(
+    num_value   = suppressWarnings(as.numeric(value)),
+    num_default = suppressWarnings(as.numeric(default)),
+    changed     = if_else(!is.na(num_value) & !is.na(num_default),
+                          num_value != num_default, value != default)
+  )
+
+# Sessions that used each tab (over 5 seconds), as the denominator
+tab_users <- count(distinct(used_visits, session, tab), tab, name = "tab_sessions")
+
+# The most common value among sessions that changed each setting
+top_new <- last_values |>
+  filter(changed) |>
+  count(id, value, name = "n_new") |>
+  group_by(id) |>
+  slice_max(n_new, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+settings_changed <- last_values |>
+  group_by(id, setting, default) |>
+  summarise(tab = names(which.max(table(tab))), sessions = sum(changed), .groups = "drop") |>
+  left_join(tab_users, by = "tab") |>
+  left_join(top_new, by = "id") |>
+  mutate(
+    pct         = 100 * sessions / tab_sessions,
+    default_lbl = choice_label(id, default),
+    new_lbl     = if_else(is.na(value), "", paste0(choice_label(id, value), " (", num(n_new), ")"))
+  ) |>
+  arrange(desc(sessions))
+
+knitr::kable(
+  select(settings_changed, setting, tab, default_lbl, sessions, pct, new_lbl),
+  col.names = c("Setting", "Tab", "Default", "Sessions that changed it",
+                "% of sessions that used the tab", "Most common new value (sessions)"),
+  digits = 1,
+  format.args = list(big.mark = ","),
+  caption = "Settings with a fixed default, by the number of sessions that ended on a different value"
+)
+```
+
+```{r}
+#| label: findings-settings
+#| include: false
+
+by_share <- arrange(settings_changed, desc(pct))
+setting_row <- \(i) filter(settings_changed, id == i)
+fdr <- setting_row("deg-limma_p_val")
+fc  <- setting_row("deg-limma_fc")
+top_color <- filter(by_share, grepl("colors", setting))[1, ]
+```
+
+- By number of sessions, the most changed settings are `r knitr::combine_words(paste0(head(settings_changed$setting, 3), " on ", head(settings_changed$tab, 3), " (", num(head(settings_changed$sessions, 3)), ")"))`. As a share of the sessions that used the tab, the top ones are `r knitr::combine_words(paste0(head(by_share$setting, 3), " on ", head(by_share$tab, 3), " (", pct(head(by_share$pct, 3)), ")"))`.
+- On Stats, `r pct(fdr$pct)` of the analysis sessions that used the tab changed the FDR cutoff from `r fdr$default_lbl`, most often to `r fdr$value` (`r num(fdr$n_new)` sessions), and `r pct(fc$pct)` changed the minimum fold-change from `r fc$default_lbl`, most often to `r fc$value` (`r num(fc$n_new)`).
+- Color settings are rarely changed: even the most often changed one, `r top_color$setting` on `r top_color$tab`, was changed in only `r pct(top_color$pct)` of the sessions that used the tab.
+
+:::
+
+## Summary
+
+<!-- This tab comes last so it can use numbers from every section above;
+     the script at the end makes the page open on it. -->
+
+### Who's counted
+
+The report counts **sessions**: one visit to iDEP, from opening the app to closing it. Each finding is out of one of these groups, and says which.
+
+```{r}
+#| label: whos-counted
+#| echo: false
+
+tibble(
+  Group = c("All sessions", "Active sessions", "Analysis sessions",
+            "Successful sessions", paste("Sessions since", day_label(last_generic))),
+  Sessions = num(c(n_sessions_all, n_distinct(events$session), length(loaded_sessions),
+                   nrow(successful), length(recent_sessions))),
+  Definition = c(
+    paste0("Every session logged, ", day_label(min(events$time)), " to ",
+           day_label(max(events$time)), "."),
+    "Sessions that did at least one thing (a click, upload or setting change). The rest did nothing and are left out of the whole report.",
+    "Active sessions that loaded data, their own or a demo.",
+    "Analysis sessions that downloaded at least one thing.",
+    "Active sessions that started after every error began to record what went wrong."
+  ),
+  "Used in" = c(
+    "Totals only",
+    "Time of day, Session length, Errors",
+    "How users use iDEP, Analysis paths, Own data vs. demo, settings in Where iDEP falls short",
+    "Successful sessions, Analysis paths",
+    "Problems in Where iDEP falls short"
+  )
+) |>
+  knitr::kable(align = "lrll")
+```
+
+### Key findings
+
+```{r}
+#| label: summary-findings
+#| include: false
+
+# The three problems that affected the most sessions since the logging
+# change, with the tab where most of them happened
+top3_problems <- head(problems, 3) |>
+  mutate(main_tab = sub(" \\(.*", "", where))
+stats_gap <- filter(tab_gap, tab == "Stats")
+```
+
+- **Who uses iDEP.** `r num(n_sessions_all)` sessions over about `r n_days` days. `r pct(100 * length(idle_sessions) / n_sessions_all)` did nothing, and `r pct(100 * length(loaded_sessions) / n_sessions_all)` loaded data (analysis sessions). Use peaks overnight in US Central time: `r pct(overnight)` of active sessions fall between 8 p.m. and 5 a.m. (*Time of day*, *How users use iDEP*)
+- **Success.** `r pct(100 * nrow(successful) / length(loaded_sessions))` of analysis sessions download at least one result. Successful sessions get to the comparison results: `r pct(stats_gap$Successful)` of them used Stats, compared with `r pct(stats_gap$"No download")` of analysis sessions with no download. (*How users use iDEP*)
+- **Where users stop.** `r pct(only_data)` of analysis sessions never get past Data, and half of those leave within `r mins(median(stuck$after_load))` of loading their data. `r share(stuck$groups == "1")` of them have only one sample group, so there's nothing to compare. (*How users use iDEP*)
+- **Crashes come from uploaded files.** Since `r day_label(last_generic)`, `r num(upload_crashes)` of the `r num(n_distinct(recent_fatal$session))` sessions that crashed did so right after a file upload, and `r share(demo$crashed)` of demo sessions crashed. (*Where iDEP falls short*, *Own data vs. demo*)
+- **A few bugs cause most errors.** `r pct(100 * recent_error_sessions / length(recent_sessions))` of sessions since `r day_label(last_generic)` hit an error, and the 10 most common problems account for `r pct(100 * top10_sessions / recent_error_sessions)` of them. The biggest are `r knitr::combine_words(paste0('"', esc(top3_problems$problem), '" on ', top3_problems$main_tab, " (", num(top3_problems$sessions), " sessions)"))`. (*Where iDEP falls short*)
+- **Two Stats defaults may be wrong.** `r pct(fdr$pct)` of analysis sessions that used Stats changed the FDR cutoff from `r fdr$default_lbl` (most often to `r fdr$value`), and `r pct(fc$pct)` changed the minimum fold-change from `r fc$default_lbl` (most often to `r fc$value`). (*Where iDEP falls short*)
+- **Demo users look; own-data users take results away.** `r share(demo$downloads > 0)` of demo sessions downloaded anything, compared with `r share(own$downloads > 0)` of own-data sessions, and `r report_pct("Demo data")` of demo users' downloads are reports, compared with `r report_pct("Own data")` for own-data users. (*Own data vs. demo*)
+
+```{=html}
+<script>
+// Open the page on the Summary tab (the last top-level tab)
+document.addEventListener("DOMContentLoaded", function () {
+  const nav = document.querySelector(".panel-tabset .nav-tabs");
+  const links = nav ? nav.querySelectorAll(":scope > li > a.nav-link") : [];
+  if (links.length) bootstrap.Tab.getOrCreateInstance(links[links.length - 1]).show();
+});
+</script>
+```
+
+:::

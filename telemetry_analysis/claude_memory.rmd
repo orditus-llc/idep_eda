@@ -1,0 +1,410 @@
+# iDEP Telemetry Analysis — Handoff Notes
+
+## Background
+- **Analyst:** Thomas Shields (SDSU). Works in **R + Quarto (.qmd) in VS Code on Windows**.
+  - R 4.4.2 (`C:\Program Files\R\R-4.4.2`). No Python installed.
+  - VS Code extensions **SQLite Viewer** and **Database Viewer Enhanced** are used to browse the .sqlite file.
+  - Packages in use: DBI, RSQLite, dplyr, tidyr, ggplot2 (scales and lubridate are also installed).
+  - Quarto is at `C:\Users\thunt\AppData\Local\Programs\Quarto\bin\quarto.exe`.
+  - Running `Rscript -e` from Git Bash crashes. Run R scripts from PowerShell, or from a script file.
+  - **Never write the .qmd with PowerShell 5.1 `Set-Content -Encoding utf8`.** It adds a byte-order mark (BOM). With a BOM before `---`, Quarto ignores the whole YAML header (no `embed-resources`, no `grid` width). Use the Edit tool, or `[IO.File]::WriteAllText` with `UTF8Encoding $false`. If VS Code's status bar says "UTF-8 with BOM", switch it to plain UTF-8.
+  - Quarto **preview** doesn't always pick up changes to `format:` options. Do a full render to check them.
+- **Working folder:** `telemetry_analysis/`
+  - Analysis document: `telemetry_analysis/telemetry_insights.qmd`
+  - Data (current): `telemetry_analysis/data_sets/idep_telemetry_10_24_26.sqlite`. The older `idep_telemetry_9_7_26.sqlite` (Aug 29 – Sep 7) is still in the folder; the new file covers the same start date, so it replaces it rather than adding to it.
+- **Goal:** understand how people use iDEP (a Shiny app, version 2.5.0): when they use it, how long sessions last, where errors and crashes happen, and which features are used.
+- **Checking work:** render to the scratchpad with `quarto.exe render telemetry_insights.qmd --output-dir <scratchpad>\render` from PowerShell (so Thomas's HTML isn't overwritten), then pull the `<li>` findings and tables out of the HTML to check them. Exploration scripts go in the session scratchpad. They `knitr::purl()` the .qmd and source the result, wrapped in `capture.output()`, because the `asis` chunk prints a lot of HTML. Send their output to a file with `sink()`; PowerShell output filters easily drop table rows. Don't call `dev.off()` there; it fails when no device is open.
+
+## How I like to work
+- When I propose a plot or analysis, **give me feedback first**: check the data, point out problems, and offer options with a recommendation. Write code only after I decide.
+- After adding code, **summarize what the code does and what the output shows**.
+- Explain concepts in plain language when they come up.
+- When the data set changes, re-check every hand-written sentence in the .qmd, not just the inline numbers.
+
+## The data (updated 2026-10-26 for `idep_telemetry_10_24_26.sqlite`)
+- One table, **`event_log`**: 529,702 rows and 5 columns:
+  - `time`: Unix timestamp in seconds
+  - `app_name`: app version (always `iDEP-2.5.0`)
+  - `session`: anonymous session ID
+  - `type`: event type
+  - `details`: JSON
+- **Date range:** Sat Aug 29, 2026, 3:26 p.m. to Sat Oct 24, 2026, 7:56 p.m. (US Central), about 56 days (8 weeks).
+  - The first and last days are partial.
+  - Weekdays are much busier than weekends (sessions by median day: Thu 2,485, Mon 2,344, Tue 2,294, Wed 2,251, Fri 1,656, Sun 1,109, Sat 949).
+- **Event types** and how many there are:
+  - `input` 320,055
+  - `feature_used` 79,113
+  - `species_selected` 21,336
+  - `download` 20,434
+  - `login` 16,136
+  - `error` 16,065
+  - `browser` 16,025
+  - `logout` 15,755
+  - `file_upload` 14,151
+  - `data_loaded` 10,522
+  - `link_click` 110 (**new** in this data set)
+- **There are 16,136 sessions.**
+- Every session that loads data loads it exactly once (10,522 `data_loaded` events in 10,522 distinct sessions, checked on the raw data). Loading new data probably starts a new session.
+- 1,731 sessions in the raw data have at least one error.
+- No daylight-saving change falls inside the range (CDT ends Nov 1), so all times are CDT.
+
+### How `details` is structured
+- **The keys depend on the event `type`.**
+- **Every value is a one-item list**, e.g. `{"species_id":["95"]}`, so extract values with `$.key[0]`.
+- Keys for each type:
+
+| type | keys |
+|---|---|
+| error | `message`, `error_class`, `output_id`, `call`, `fatal` |
+| data_loaded | `source` (upload/demo), `demo_id`, `genes_bucket`, `groups_bucket`, `samples_bucket` |
+| input | `id`, `value` |
+| download | `id` |
+| browser | `value` (e.g. "Chrome 151") |
+| file_upload | `input_id` |
+| feature_used | `feature_id` |
+| species_selected | `species_id` |
+| login / logout | `username` |
+| link_click | `link_id` (e.g. `public-data` 43, `cite-idep` 18, `mirror-site` 7, `old-v096`/`old-v244`/`old-v201` links to old iDEP versions) |
+
+- `id` and `value` are each used by two event types, so filter by `type` before using them.
+- `fatal` is stored as the **text** `"TRUE"`/`"FALSE"`, not as R's TRUE/FALSE.
+- An `error_class` that starts with `shiny.error.fatal/` means the error crashed the session.
+- **98% of sessions end with `logout`, even sessions that crashed.** So a session's last event can't tell you how it ended.
+- Every session starts with `login`.
+- **`fatal` always agrees with `error_class`.** All 9,870 errors with `fatal == "TRUE"` have a `shiny.error.fatal/` class, and no error has a missing `fatal`. So it's safe to use `fatal` alone.
+- **`link_click` counts as a user action** (in `user_types` since 2026-11-07, labelled "Clicked link: …" in `action`). That made 23 sessions active whose only action was a link click.
+
+### Where errors happen
+- **`output_id` changed on Sep 12, 2026** (probably an app update). Before that it was always `"global"`. Since then:
+  - Non-fatal errors usually name the output that failed, e.g. `pca-pcatools_eigencor`, `pathway-12_heatmap_1-main_heatmap`. Its module prefix matches the tab we infer from navbar events in about 99% of cases (the DEG prefix on Stats is expected; see below). So the inferred tab is trustworthy.
+  - **Fatal errors still don't say where they happened**: most name `load_data-default_species_message` (5,215) or `global` (4,263), whatever the tab, because a crash makes every output fail.
+  - The report still places errors by the inferred tab. `output_id` could be used for a finer look at non-fatal errors (which plot or table failed).
+- **Tab switches are recorded** as `input` events with `id == "navbar"`, and `value` holds the tab name.
+  - The starting tab isn't recorded. Before the first switch, the user is on **Data**.
+  - (Checked on the Sep 7 data:) the navbar value never repeats twice in a row, and no error happens in the same second as a tab switch.
+- **The app's tabs:** Data, Prep, Cluster, PCA, Stats, DEG, Pathway, Genome, Bicluster and Network. Doc and info_we_collect also exist; they have little traffic and no errors.
+- Each tab's controls start with a prefix: `load_data-` (Data), `pre_process-` (Prep), `clustering-` (Cluster), `pca-`, `deg-`, `pathway-`, `genome-`, `bicluster-`, `network-`.
+  - **The Stats tab's controls also use `deg-`**, e.g. `deg-step_1` and `deg-submit_model_button`. So `readable()` labels them "DEG › …". Thomas chose (2026-11-04) to keep those labels and explain them in a note on the Stats error subtab (written in the `errors-by-step` loop), rather than relabel them by tab.
+- **Inputs that switch panels** have IDs ending in `_tabs`, `_panels` or `subtab`, or starting with `deg-step_`. Their `value` is the panel that was opened (e.g. PCAtools, t-SNE, QC, Heatmap).
+- **One crash logs a burst of fatal error events within about 1 second**, sometimes with different messages: median 17 per crash, 75% have 19 or fewer, but a quarter have 4 or fewer. So **count sessions or incidents, never error events.**
+- **Most non-fatal errors now say what went wrong.** Only 199 of the 2,024 non-fatal incidents have just Shiny's generic message ("An error has occurred. Check your logs…").
+- **Two separate logging fixes (checked 2026-11-04):** real non-fatal messages start **Sep 6, after 5:51 p.m. Central** (`last_generic`) (every non-fatal error before that is generic, none after; no session has both). `output_id` starts **Sep 12, 4:32 p.m. Central**. **Fatal errors always had the real message**, and the crash rate is the same before and after (13.6 vs 12.8 crashing sessions/day).
+- **So any count of non-fatal errors by message covers only Sep 6 on** (about 7 of 8 weeks); the first week's generic errors may hide more of the same bug. Counts by step and counts of fatal messages cover the whole range. All current message-matching bullets (`ensembl_ID`, `factorLevel`, multibyte, WGCNA) count fatal errors, so they're fine. The "Errors on each tab" intro now tells the reader this in bold (dates from `last_generic` and `min(events$time)`); if a non-fatal message count is added elsewhere (e.g. a bullet), say so there too. Don't relabel generic errors as a known message ("probably the same bug" at most).
+- **Before/after check (2026-11-04; the script was in a session scratchpad and is gone):** sessions were split into three periods by their start time (up to `last_generic`, up to Sep 12 4:32 p.m. Central, after), and for each tab the share of sessions with a non-fatal / fatal error was compared, plus incidents per 100 sessions that took each common step. Non-fatal rates per tab are about the same before Sep 6, Sep 6–12 and after Sep 12, and the main bugs continue (PCAtools, enrichment Details, volcano labels, Pathway, Stats `factorLevel`, Data uploads). Bicluster's 10.7% before Sep 6 is only 12 sessions, spread over time; noise. **One exception: the `ensembl_ID` crash (12 incidents, DEG + Stats) happened only Sep 1–5**, and the 12 generic Stats errors after Submit model fall on the same days (probably the same bug, a guess). **We don't know there was an app update**: `app_name` never changes, and the Sep 6 message change could be a Shiny setting (sanitize errors) rather than new code. The report says the crash "seems to have been fixed", not that it was. Not yet checked: how many sessions/users the 12 crashes came from (a few users retrying would also explain the stop).
+- The data provider advised dropping all errors before Sep 13 (`time >= 1789257600`). **Thomas decided instead to keep them and mark generic ones as their own error type**, since only the non-fatal message (flagged) and `output_id` (not used for placement) were unreliable. A date cutoff on errors alone would also make error rates too low unless the session denominators were cut too.
+- Some messages contain line breaks, control characters, `<`, `$` and backticks. **Backticks broke the HTML error tables** (Pandoc read them as code), so the `errors-by-step` chunk now writes `` ` `` and `$` as `&#96;` and `&#36;`.
+- Several tabs share the same enrichment module (`*-enrichment_table_cluster-*`), so the same bug shows up on Cluster, DEG, Bicluster and Network (e.g. "Text to be written must be a length-one character vector" on the Details subtab).
+
+### Events that fire on their own
+- `species_selected` fires at the start of almost every session.
+- Opening a tab sets its default panel and selectors within about 1 s. Examples: `deg-step_2`, `deg-step_1`, `pathway-pathway_tabs`, and `feature_used` for `deg-select_model_comprions` / `deg-select_contrast`. That's why a user action must come more than 1 s after the tab opens.
+- **`feature_used` for `pre_process-scatter_x` / `scatter_y` fires right after data loads** (88% within 3 s, median 0.7 s), while the user is still on Data. **Since 2026-11-07, those within 0–3 s after a `data_loaded` are automatic** (`load_times`, `scatter_rows` in `remove-idle`). Later ones, mostly on Prep, are real axis changes and still count. This doesn't change the idle count (those sessions loaded data). The ~30 Data crashes that used to show "Used: Prep › Scatter y" as their step now show "Data loaded (upload)", and the Data bullet says "another N right after the data loaded".
+- **`events$auto_event`** (TRUE for burst and automatic Scatter rows) sets `user_action` to FALSE **and `action` to NA**, so automatic events are never the "step" before an error. (`action` is otherwise set for every event by type, not just user actions. Panel switches that fire on their own within 1 s of a tab opening still get a label and can still be steps; that wasn't changed.)
+- **The Data Wrangling tab now has a short bullet list above `remove-idle`** explaining what counts as a user action and what doesn't (the first second after a tab opens, species, the burst, Scatter within 3 s of a data load; Reset counts). Thomas asked for this. Keep it in sync with the code.
+- **The default-fill burst (handled since 2026-11-07):** in 1,351 sessions the server fills 7 inputs with their defaults in the same second while the user is on Data (`pre_process-eda_tabs` NA + Distribution, `pre_process-heat_color_select` Green, `clustering-dist_function` 1, `deg-plot_color_select_1`/`deg-plot_color_select` Green-Red, `pathway-pgsea_plot_color_select` Blue-Red, `pathway-kegg_color_select` Green-Red). The values match the server's `updateSelectInput()` defaults in the source. `remove-idle` now marks any of these IDs within 1 s of a Prep heatmap "Green" event as not a user action (`burst_ids`, `burst_times`, `burst_rows`, `n_burst_sessions`, `burst_idle`). This made 482 more sessions idle. It's explained in the Q10 intro paragraph (Thomas's choice) and in the Data Wrangling bullet list. **Current counts (after the burst, Scatter and `link_click` changes): 3,507 idle, 12,629 active, 2,107 active but never loaded data, 10,522 analysis sessions, 11,033 sessions since Sep 6.**
+- **Settings are only logged when they change, and number boxes log every keystroke** (typing 0.05 logs 0, then 0.05). Use each session's last value.
+- `load_data-reset_app_new_data` (the Reset button) **is a real user action** (settled 2026-11-07). It's an `actionButton` that calls `session$reload()` (mod_01_load_data.R:1193), so a reset also starts a new session.
+- **`deg-select_model_comprions` is partly automatic (not handled; Thomas chose to deal with it in Q2).** It's a `checkboxGroupInput` inside `renderUI` (mod_05_deg.R:609) that re-renders whenever the comparison list changes. It has 21,866 events, 15,213 right after another one; median 3 per session, max 413. It doesn't affect idle counts, but it does affect Stats error steps and any features analysis.
+- `logout` comes when the browser closes or the session times out: a median of 85 s after the last real event, but over 17 min for 25% of sessions and about an hour for 10%.
+
+## What the .qmd does now
+- **HTML output with tabs at the top** (`::: {.panel-tabset}`):
+  1. **Data Wrangling**: the code is shown and all outputs are hidden (`#| output: false`). It does eight things, in this order:
+     - Loads the libraries.
+     - Reads the database with a relative path (`db_path`), read-only. If the file isn't found, it tries `telemetry_analysis/` in front of the path, for when chunks are run from the workspace root.
+     - Previews the raw data.
+     - Builds the data frame **`events`**: it finds every JSON key with `json_each()`, writes one `CAST(json_extract(details, '$.key[0]') AS TEXT)` per key, and converts `time` to a date-time (UTC). New keys (like `link_id`) get a column automatically.
+     - **Add the current tab:** adds an `events$tab` column with the tab the user was on. It fills forward from navbar events, and it's Data before the first switch.
+     - **Remove sessions with no activity:** adds `events$visit` (a new visit at each navbar event) and `events$user_action`. A user action is an `input` (other than navbar), `feature_used`, `download`, `file_upload`, `data_loaded` or `link_click` **more than 1 s after the tab opened**; earlier ones fire on their own. `species_selected` is never an action, nor are `auto_event` rows (the burst and automatic Scatter x/y; see "Events that fire on their own"). **The 3,507 sessions with no user action (`idle_sessions`) are removed from `events` for the whole report**; `n_sessions_all` (16,136) keeps the original count. This removed 44 error events.
+     - **Measure time on each tab:** builds **`visits`**, one row per tab visit, with `secs` (raw time until the next tab) and `active_secs` (each gap between events capped at `idle_cap` = 10 min). Logout events are dropped, because logout can come an hour or more after the last real event.
+     - **Group errors into incidents:**
+       - Adds an `events$action` column with a readable label for each user action. Examples: `Opened the PCA tab`, `Switched panel: PCA › PCA panels → t-SNE`, `Clicked: …`, `Changed setting: …`, `Used: …`, `Downloaded: …`, `Uploaded file: Data › Expression file`, `Data loaded (upload)`, `Selected species`.
+       - `readable()` turns IDs into labels: the module prefix becomes the tab name, underscores become spaces, and short forms are spelled out using the `words` lookup.
+       - Builds **`error_incidents`**, with one row per incident. An incident is errors in the same session and tab less than 2 seconds apart.
+         - Its columns are `session`, `tab`, `step` (the last action before the incident), `message`, `fatal` ("Fatal"/"Non-fatal") and **`error_type`** ("Fatal", "Non-fatal", "Non-fatal, generic message"; added 2026-11-04). `fatal` is kept because `n_incidents()` and other code use it.
+         - `last_generic` (also in this chunk) is the time of the last generic error; the Errors intro and a bullet show it with `day_label()`.
+         - `last_ensembl` and `days_since_ensembl` (also in this chunk, added 2026-11-04): when the fatal `ensembl_ID` crash last happened, and the days from then to the end of the data. Used in the Errors intro ("Some bugs also seem to have been fixed…") and the DEG bullet. They're here, not in `findings-steps`, because the intro's inline R runs before that chunk.
+         - The message is a fatal one if there is one, otherwise a specific one rather than the generic one. Whitespace is flattened, but nothing is cut off.
+  2. **Initial Insights**: each chunk uses `#| code-fold: true` and `#| code-summary: "Show code"`.
+     - **Subtabs:** a nested `::: {.panel-tabset}` with 7 `###` tab titles: **Time of day | Session length | Errors | How users use iDEP | Analysis paths | Own data vs. demo | Where iDEP falls short**. Each tab opens with its question as a `####` heading. The Errors tab holds both the errors-by-tab table and the "Errors on each tab" subtabset (`#####`, written by the loop).
+     - **Chunk order matters:** later tabs reuse objects from earlier ones, e.g. `tabs` and `with_pct()` from the Errors tab, and `num()`, `pct()` and `mins()` from Time of day.
+     - **How users use iDEP**, first question. Uses only the **sessions that loaded data** (`loaded_sessions`, 10,522). A tab counts as used when the visit lasted **more than 5 s** (`used_visits`).
+       - Chart `tabs-used`: two panels (`facet_wrap`, free x): the share of sessions that used each tab, and the median active minutes per session on the tab. Tabs are in app order.
+       - Chart `session-flow`: a 100% stacked area over session progress (0–100% of a session's active time), showing the share of sessions on each tab. It has 7 tabs plus gray "Other tabs" (Genome, Bicluster, Network), coloured with the dataviz reference palette slots 1–7 in app order.
+       - Bullets (`findings-usage`): active sessions that never loaded data (and how many crashed), tabs per session, the most and least used tabs, the time share on Data, the tab with the longest stays, and the Data share over the session.
+       - **Who never gets past Data?** (`data-only`) builds **`session_profile`**, with one row per loaded-data session: `source`, `groups`, `crashed`, `clicked_tab`, `downloads`, `after_load`, `active_min`, `n_tabs` and `past_data`. (`outcome` is added later, in `successful-sessions`.) **`profile_table(profiles, group)`** gives a two-column comparison of the same 9 measures. Both are reused in the success section. The section has a kable comparing "Never past Data" with "Went on to other tabs", plus bullets.
+       - **Successful sessions** (Q3; Thomas defined success as **at least one download**, counting only downloads that are user actions): a profile table (Successful vs. No download), a dodged bar chart of tab use by outcome (blue vs. gray `#b5b3ad`), a table of the top 10 downloads by sessions, and bullets.
+       - Still blank in this tab: features (Q2), and downloads (Q5) beyond the top-10 table.
+     - **Analysis paths** (added 2026-10-28). Both sections reuse objects from the success section (`successful`, `downloads`, `session_profile`), so they must stay after it.
+       - **Top 5 paths of successful sessions** (Q7, under the "Which sequences of tabs…" heading). Chunk `success-paths` builds **`success_paths`**: one path per successful session, such as "Data → Prep → Stats", over the **whole session** (not stopped at the first download), using `used_visits` (over 5 s) and the **first visit to each tab only**. `top_paths` is the top 5, shown in a kable with columns Path | Sessions | % of all successful sessions; the caption gives the total number of successful sessions. `findings-paths` computes `n_paths` and `first_dl_tab` (the tab of each session's first download). Three bullets.
+       - **Why sessions end on a tab** (Q4). Chunk `session-endings`:
+         - `visit_info`: one row per visit of a loaded-data session, with `acted` (any user action), `crashed_here`, `error_here` (non-fatal), joined to `visits` for `tab` and `secs`.
+         - **`last_visit`**: the last visit with a user action, **or lasting over 15 s** (Thomas's rule), or where the session crashed (my addition, so crashes as a tab opens aren't placed on the previous tab; affects 15 sessions).
+         - `last_action`: the session's last user action (`last_id`, `last_label`).
+         - **`endings`**: one ending per session, checked in this order: **Crashed** (session had a fatal error), **Downloaded something**, **Started over** (last action is `load_data-reset_app_new_data`, no download), **Error, no download** (non-fatal error on the last tab), **Left without a download** (unclear).
+         - Chart: horizontal 100% stacked bars, one per last tab (7 main tabs plus "Other tabs" = Genome, Bicluster, Network, Doc), with session counts in the labels. Colours: Downloaded blue `#2a78d6`, Started over green `#1baf7a`, Left without a download gray `#b5b3ad`, Error amber `#eda100`, Crashed orange `#eb6834`. Segment labels need `group = ending` in `geom_text`, or they stack separately from the fills and land in the wrong segments.
+         - `findings-endings` defines `end_overall`, `end_pct()`, `top_end_tabs`, `started_data`, `unclear_last` (the most common last action of "Left without a download" sessions on Stats, Cluster and Pathway) and `crash_tab`. Four bullets.
+     - **Own data vs. demo** (Q6, added 2026-10-28). Must stay after Analysis paths (reuses `progress`, `points`, `flow_tabs`, `flow_colours`, `downloads`, `session_profile`, `profile_table()`, `share()`).
+       - `demo-profile`: adds **`session_profile$data_source`** ("Own data" / "Demo data", from `source`) and shows `profile_table(session_profile, "data_source")` without the "Used the demo data" and "Data has only one sample group" rows (**the demo data has no `groups_bucket`**, so that row would be blank).
+       - `demo-flow`: the session-flow chart split into two panels (`facet_wrap`, Own data left, Demo data right; panel titles show session counts). Data is `flow_source`, built like `flow` but counted by `data_source`.
+       - `demo-downloads`: `source_downloads` (downloads joined to `data_source`; **`downloads` has an empty `source` column from `events`, so drop it before joining** or the join makes `source.x`/`source.y`), and `top_dl_source`, the top 5 downloads per group side by side with session counts.
+       - `findings-demo` defines `demo`, `own`, `report_share`/`report_pct()` (share of downloads whose label contains "Report"), and `data_half()` (share of a group on Data halfway through). Five bullets.
+     - **Where iDEP falls short** (added 2026-11-07; Q9's heading removed). Must stay last (reuses `downloads`, `used_visits`, `loaded_sessions`, `only_data`, `end_pct()`, `pct()`, `num()`).
+       - **Q8, `top-problems`:** only sessions that started after `last_generic` (`recent_sessions`, `recent_incidents`). `problem` = message with numbers → "N" (**no " at .*" trim**; that cut real messages). `problems` groups by problem + fatal: `where` ("PCA (217), DEG (3)"), `top_step` + `step_pct`, sessions, incidents, and `dl_after` (share of affected sessions with a download *after* their first incident of it, from `first_hit`; blank for fatal since a crash ends the session). Top 15 shown as an HTML kable with the backtick/`$` escaping. `error_incidents` now has a `time` column (incident start) for this.
+       - `findings-shortfalls`: `recent_error_sessions`, `top10_sessions`, `upload_crashes`, `recover` (top-15 non-fatal problems by `dl_after`), `esc()` (backtick/`$` escaping for inline R). Four bullets, the last linking to never-past-Data and "Left without a download".
+       - **Q10, `settings-changed`:** `settings` (tribble: id, readable name from the app's labels, default from the **iDEP 2.4.4 source**, GitHub `gexijin/idepGolem` master `60479c4`; Thomas said not to ask about 2.5.0) and `choice_labels` (code → label, e.g. counts_transform 1 = edgeR). `last_values`: each loaded session's last non-NA user-set value; numbers compared as numbers. Denominator `tab_users` = sessions that used the tab (>5 s). `settings_changed` table: Setting | Tab | Default | Sessions that changed it | % of tab sessions | Most common new value. Left out: data_file_format and select_go (no default), filtered_background (set from data), no_id_conversion (set by species box).
+       - `findings-settings`: `by_share`, `fdr`, `fc`, `top_color`. Three bullets.
+     - Thomas prefers **fewer, combined tabs** over one tab per question.
+     - **Findings bullets** come after each section. A hidden chunk (`#| include: false`; labels `findings-time`, `findings-length`, `findings-tabs`, `findings-steps`, `findings-usage`, `findings-data-only`, `findings-success`, `findings-paths`, `findings-endings`, `findings-demo`) calculates the numbers, and the bullets show them with inline R. `share()` (a percentage of TRUE, ignoring NA) is defined in `findings-data-only`. Switching data sets updates the numbers, but the wording has to be checked by hand.
+       - Helpers defined in `findings-time`: `num()`, `pct()`, `mins()`, `hour_label()`, `day_label()`. `n_incidents(tab, fatal_only, msg, after)` in `findings-steps` counts incidents, optionally filtered by text in the message and/or step (fixed-string match).
+       - `data_crash_msgs` in `findings-steps` (added 2026-10-26): the top 3 Data crash messages, with numbers replaced by "N" and anything after " at " dropped, so "line 27 did not have 2 elements" variants count together. The Data bullet uses it instead of hard-coded messages.
+       - The per-tab bullets still match specific message or step text (`"invalid multibyte string"`, `"<d0><cf>"`, step `"Data loaded"`, `"ensembl_ID"`, `"Opened the DEG tab"`, `"factorLevel"`, `"Experiment design"`, `"fewer than 4 genes"`, step `"PCAtools"`). New data with different messages will show 0.
+     - **Sessions by median hour of day:** a bar chart in **US Central time** (`America/Chicago`). It takes the median of each session's full timestamps, then the hour, so sessions that cross midnight are handled correctly.
+     - **Active session length by error outcome:** a boxplot of **active minutes** (from `visits`) on a log scale, with three groups:
+       - **No error**
+       - **Non-fatal error only**
+       - **Fatal error**: the worst error in the session decides its group.
+       - Each label shows the group's session count and median length.
+     - **Where do errors occur?** A `knitr::kable` table with one row per tab (the ten tabs only), in app order like the subtabs (Thomas, 2026-11-04; it used to be sorted by visits). The columns are:
+       - Visits: each time a session enters the tab.
+       - Sessions on tab.
+       - Sessions with only non-fatal errors, **"Of these, generic message"** (a subset of the non-fatal column, added 2026-11-04), and sessions with a fatal error. Fatal and non-fatal don't overlap: the worst error on that tab decides.
+       - % non-fatal only, and % fatal.
+     - **Errors on each tab:** a nested tabset with 10 subtabs in app order. The chunk uses `#| output: asis` and writes `::: {.panel-tabset}` and `#####` headings in a loop.
+       - Each subtab has a summary line ("N incidents (F fatal, X non-fatal, of which G with a generic message) in S sessions"), then an HTML `kable` table (`format = "html"`, with backticks and `$` turned into HTML codes) with the columns Step before the error | Error type | Error message | Incidents | Sessions, sorted by incidents. Generic errors stay **in the same table** (Thomas's choice), with type "Non-fatal, generic message" and message "Unknown (only Shiny's generic message was logged)".
+       - The Stats subtab alone has an extra note between the summary line and the table, explaining that its steps say "DEG ›" because Stats and DEG share the `deg-` module (added 2026-11-04, `if (t == "Stats")` in the loop).
+       - With the bigger data set these tables are long (Data has ~100 rows, mostly one-off messages). Possibly worth grouping messages or showing only the top rows (discuss first).
+- **Plot style:** ggplot2, `theme_minimal`, bars in blue `#2a78d6`, box fill `#9ec5f4` with outline `#184f95`, no vertical gridlines, bold title, gray subtitle `#52514e`.
+  - Newer charts drop all gridlines and the value axis, and label bars directly instead.
+  - The comparison group is gray (`#b5b3ad`).
+  - Categorical colours follow the dataviz reference order: `#2a78d6, #eb6834, #1baf7a, #eda100, #e87ba4, #008300, #6250d6`, with `#898781` for "Other".
+  - Two measures with different scales get two panels (`facet_wrap`), never a dual axis.
+  - The dataviz palette validator needs Node, which isn't installed.
+
+## Decisions made
+- Show times in **US Central** ("when people use it on our clock"). There's no location data, so we can't know users' local times.
+- Use **three error groups** (no error / non-fatal only / fatal), not two.
+- Skip the **day-of-week plot**. That was decided with 9 days of data. **With 8 weeks now, each weekday appears 8 times, so this could be revisited** (weekdays look about twice as busy as weekends).
+- Plot session length on a **log scale**: active lengths range from seconds to hours.
+- **Success = at least one download** (Thomas's definition).
+- **Errors are placed on the tab the user was on** when they happened, worked out from navbar events. (`output_id` now confirms this for non-fatal errors since Sep 12.)
+- **Be clear about which errors we know and which we're guessing at** (Thomas, 2026-11-04). Keep every error, but mark non-fatal errors with only the generic message as "Non-fatal, generic message": they still count as non-fatal, and for them the step is a guess, not a known cause. No date cutoff.
+- **Error tables:** use **incidents** as the main count and **sessions** as a second column.
+- **Write everything legibly:** never cut off messages, replace underscores with readable labels, and always show which sub-panel was opened when switching panels caused an error.
+- Page width: set with `grid: body-width` in the YAML (currently 1400px). Thomas sets it himself.
+- **Leave out sessions with no activity** everywhere, and report them as a count. **An empty visit** (a tab clicked through) is one lasting 5 s or less. **Usage analysis** uses only sessions that loaded data.
+- **Time on a tab** counts each pause between events as at most 10 minutes, and ends at the last real event, not logout.
+- **The session-length boxplot uses active time** (the sum of `visits$active_secs`).
+- **Findings in the report use calculated numbers** (inline R), not typed-in ones, so a new data set only needs `db_path` changed. They're placed as short bullets under each section.
+- **Paths of successful sessions:** follow the whole session (stopping at the first download gave short paths like Data → Prep, because the first download is often an early figure), count only the first visit to each tab, and show the **top 5**.
+- **A session's last tab** is its last visit with a user action or lasting over 15 s (plus a visit where it crashed). **"Started over" is its own ending group**, but **"Downloaded something" is checked before it**: 574 sessions downloaded and then reset, and they count as downloaded. This makes "Downloaded something" (38%) match the success share.
+
+## Findings so far (Oct 24 data)
+All numbers below are for the 13,088 active sessions (idle sessions removed), unless they say otherwise. **These were counted before the 2026-11-07 user-action changes** (now 12,629 active and 3,507 idle). Numbers about analysis sessions (10,522) and errors are unchanged; numbers out of active sessions have shifted a little. The rendered report is the current source.
+
+- **Use peaks overnight Central time.** The busiest hours are 3 a.m., 4 a.m. and 2 a.m., and the quietest are 6 p.m., 5 p.m. and 7 p.m. 46% of sessions fall between 8 p.m. and 5 a.m. (38% if spread evenly). That's probably users in Asia and Europe, but it's unconfirmed.
+- **Active session length:** median 6.9 minutes, 25% under 2.0 minutes, 25% over 17.4 minutes.
+
+| Group | Sessions | Median active length |
+|---|---|---|
+| No error | 11,365 | 6.4 min |
+| Non-fatal error only | 997 | 27.5 min |
+| Fatal error | 726 | 1.6 min |
+
+- **Fatal crashes happen early**: 75% of sessions with a fatal error end within 5.2 minutes, mostly at data upload. The crash is what makes these sessions short.
+- **Sessions with only non-fatal errors are the longest.** That's most likely because longer sessions have more chances to hit an error (heavy users). It doesn't mean errors keep people around.
+- Of the 16,065 error events in the raw data (16,021 after removing idle sessions), 9,870 are fatal. The most common error classes are `shiny.error.fatal/simpleError` (9,830) and `simpleError` (5,615), then `rlang_error` (433). The most common `call` values are `read.table`, `apply`, `scan`, blank, `seq_len` and `.rowNamesDF<-`, which suggests that file reading and parsing is the main cause.
+- `data_loaded` events: 10,026 from user uploads and 496 from demo datasets.
+
+### How people use iDEP (after removing 3,048 sessions with no activity)
+- Of 16,136 sessions: 3,048 did nothing (19%), 2,566 did something but never loaded data (324 of them crashed, 313 right after an expression-file upload), and **10,522 (65%) loaded data**.
+- Among sessions that loaded data: the median uses 4 tabs counting Data, and 18% never get past Data. The most used tabs are Stats (58%), Prep (53%) and DEG (44%), then PCA (41%), Cluster (37%) and Pathway (27%). Network, Bicluster and Genome are each around 5–6%.
+- On average, 44% of a session's active time is on Data; next are Stats (13%) and DEG (10%). Pathway has the longest stays (median 4.5 min), then DEG (2.2 min).
+- Halfway through a session 36% are still on Data, and 28% at the end. Stats (17%) and DEG (15%) are the most common analysis tabs in the last quarter of sessions.
+- **Never past Data: 1,863 sessions (18% of those that loaded data).**
+  - 13% crashed, compared with 2% of the sessions that went on, most often after an experiment-file upload (106 sessions).
+  - Half end within 0.3 min of the data loading, and 81% never click another tab.
+  - 43% have only one sample group (26% of the sessions that went on), so there's nothing to compare.
+  - 10% used the demo data (4% of the rest), and 1% downloaded anything.
+- **Successful (at least one download): 4,029 sessions**, which is 38% of those that loaded data and 25% of all sessions.
+  - Median 5 tabs and 18.4 active min, compared with 3 tabs and 6.1 min for the rest.
+  - The biggest gaps are Stats (79% vs. 45%) and DEG (64% vs. 32%).
+  - Only 2% used the demo data (7% of the rest).
+  - Median 2 downloads per session. The top downloads by sessions are DEG significant genes (771), DEG LFC (735) and the DEG gene list (608), then Pathway significant pathways (463).
+
+### Analysis paths (added 2026-10-28)
+- **Top 5 paths of successful sessions** (4,029 sessions, 734 different paths; the top 5 cover only 23%):
+  1. Data → Prep → Cluster → PCA → Stats → DEG → Pathway: 226 (5.6%)
+  2. Data → Prep: 203 (5.0%)
+  3. Data → Prep → Cluster → PCA → Stats → DEG: 167 (4.1%)
+  4. Data → Stats → DEG: 167 (4.1%)
+  5. Data → Stats → DEG → Pathway: 162 (4.0%)
+  - Two routes stand out: the full workflow in app order, and the shortcut from Data straight to Stats and DEG.
+  - The first download is on Stats (23%), Prep (21%), DEG (18%), Cluster (13%), Pathway (12%) or PCA (10%).
+  - (Checked but not used: paths stopped at the first download had 383 different paths, and the top 5 covered 38%, led by Data → Prep at 16%.)
+- **How sessions end** (10,522 loaded-data sessions): Data 34%, DEG 15% and Stats 14% are the most common last tabs.
+  - Overall: Downloaded something 38%, Started over 14% (1,517, all on Data), Left without a download 43%, Error with no download 1%, Crashed 4%.
+  - On Data (3,614 endings): Started over 42%, Left without a download 32%, Downloaded 18%, Crashed 8%.
+  - Pathway (57%) and DEG (54%) have the highest download shares. PCA has the most endings on a non-fatal error (6%).
+  - "Left without a download" sessions often end right after Submit: Submit model on Stats (66%), Submit heatmap on Cluster (56%), Submit pathway on Pathway (47%). We can't tell whether they were satisfied or gave up.
+  - Of the sessions that reset to load new data, 72% had used another tab first.
+
+### Own data vs. demo (added 2026-10-28)
+- 496 loaded-data sessions used the demo data (5%) and 10,026 their own. Almost half of demo sessions (229) used demo data set 12.
+
+| Measure | Own data | Demo data |
+|---|---|---|
+| Downloaded something | 39% | 14% |
+| Downloads per session (average) | 2.0 | 0.3 |
+| Never past Data | 17% | 37% |
+| On Data halfway through the session | 35% | 54% |
+| Median tabs used | 4 | 3 |
+| Median active minutes | 10.2 | 5.8 |
+| Clicked another tab at all | 86% | 69% |
+| Crashed | 4% | 0% |
+
+- **Demo users download reports** (36% of their downloads, vs. 13% for own data): top demo downloads are the DEG report (12 sessions), the demo expression file (11), Prep processed data (9), the Prep report (7) and the Cluster report (6). Own-data users take data tables: significant genes (770), fold changes (732), the DEG gene list (605), significant pathways (460), the DEG report (390).
+- Demo users use every analysis tab less (e.g. Stats 43% vs. 59%, DEG 34% vs. 45%), but Genome, Bicluster and Network are 5–6% in both groups. Those who leave Data follow roughly the same route, with relatively more time on Prep, Cluster and PCA and less on Stats.
+- **No demo session crashed**, which supports the finding that crashes come from uploaded files.
+
+### Errors by tab
+
+| Tab | Visits | Sessions on tab | Only non-fatal | Fatal | % non-fatal only | % fatal |
+|---|---|---|---|---|---|---|
+| Data | 20,373 | 13,088 | 1 | 614 | 0.0 | 4.7 |
+| Stats | 14,885 | 6,587 | 15 | 30 | 0.2 | 0.5 |
+| DEG | 13,873 | 5,593 | 262 | 14 | 4.7 | 0.3 |
+| Prep | 12,769 | 7,190 | 76 | 49 | 1.1 | 0.7 |
+| PCA | 10,408 | 5,663 | 476 | 2 | 8.4 | 0.0 |
+| Cluster | 10,296 | 5,524 | 110 | 3 | 2.0 | 0.1 |
+| Pathway | 7,013 | 3,582 | 196 | 2 | 5.5 | 0.1 |
+| Genome | 1,847 | 1,267 | 0 | 0 | 0.0 | 0.0 |
+| Bicluster | 1,339 | 956 | 50 | 1 | 5.2 | 0.1 |
+| Network | 1,053 | 820 | 27 | 15 | 3.3 | 1.8 |
+
+- **Traffic is concentrated in the core workflow.** Data, Stats, DEG, Prep, PCA and Cluster each get more than 10,000 visits. Pathway gets 7,000, and Genome, Bicluster and Network fewer than 2,000 each. (These visit counts include click-throughs of 5 s or less.)
+- **Users revisit tabs often.** DEG and Stats get more than 2.3 visits per session.
+- **Most crashes are on Data**: 614 of the 726 sessions with a fatal error (85%). Data has only 1 session with a non-fatal-only error.
+- **PCA (8.4%), Pathway (5.5%), Bicluster (5.2%) and DEG (4.7%) have the highest non-fatal error rates.** Network has the highest fatal rate after Data (1.8%).
+- The 16,021 error events form **2,766 incidents** (2,024 non-fatal).
+
+### Steps that cause errors
+- **Data:** 536 of 623 crashes come right after a file upload, and 30 more after the automatic "Used: Prep › Scatter y" (also at upload).
+  - Top messages: "dim(X) must have a positive length" (135), "duplicate 'row.names' are not allowed" (102), "line N did not have N elements" (100), "more columns than column names" (64), "missing value where TRUE/FALSE needed" (63).
+  - "invalid multibyte string" (27); 16 start with `<d0><cf>`, the start of an old Excel (.xls) file. Others start with `<ff><fe>` (UTF-16 text) or `<89>PNG` (an image).
+- **Prep:**
+  - Crashes: "all samples have 0 counts" and DESeq2 `vst` "less than 'nsub' rows", on opening the tab or after changing `n_min_samples_count` / min counts.
+  - Non-fatal: "Faceting variables must have at least one value" when switching to the QC panel (40 incidents).
+- **Cluster:** non-fatal only (almost). Enrichment Details subtab "Text to be written must be a length-one character vector" (40); Submit heatmap "object 'obj' not found" (27); heatmap brush "exceeds the maximum (50000px)" (19).
+- **PCA:** 460 of 749 incidents happen when switching to the **PCAtools** panel ("argument must be coercible to non-negative integer" 270, "undefined columns selected" 142). Biplot downloads give the same two errors. t-SNE gives "perplexity is too large"; MDS gives "'k' must be in {1, 2, .. n - 1}".
+- **Stats:** 20 of 30 crashes are "object 'factorLevel' not found": 10 at Step 1 → Experiment design, 7 after choosing comparisons, 3 after choosing factors. 2 more are the `ensembl_ID` join error after Submit model. 12 non-fatal (generic) after Submit model.
+- **DEG:** 10 of 14 crashes are "Can't join `x$ensembl_ID` (character) with `y$ensembl_ID` (integer)", **all right when the tab opens**. Likely one bug (also hits Stats, above). Most non-fatal errors: Enrichment Details "Text to be written…" (84) and volcano/MA label settings giving "`1:input$num_genes`: NA/NaN argument" (~130 incidents across Customize labels, Number of genes, Sort type, Gene label type).
+- **Pathway:** Heatmap panel and Select GO give "invalid argument to unary operator" (126 + 61). Submit pathway and GSEA give "Empty strings are not allowed in names(stats)" and "object 'top' not found".
+- **Bicluster:** opening the tab gives "'by' must specify a uniquely valid column" (13) or "object 'clust_info' not found".
+- **Network:** opening the tab gives "the 'height' component of 'tree' is not sorted" (16). 6 of 15 crashes are WGCNA's "fewer than 4 genes or samples" error.
+- **Genome:** no errors.
+- **Shared enrichment module bug:** "Text to be written must be a length-one character vector" on the Enrichment Details subtab appears on Cluster, DEG, Bicluster and Network (~140 incidents).
+
+### How the Oct 24 data compares with the Sep 7 data
+The Sep 7 file (9 days) is the first part of the Oct 24 file (56 days), so these are not independent samples, but they show how stable the early findings were.
+
+| Measure | Sep 7 data | Oct 24 data |
+|---|---|---|
+| Sessions | 2,502 | 16,136 |
+| Did nothing (idle) | 652 (26%) | 3,048 (19%) |
+| Active but never loaded data | 476 (59 crashed) | 2,566 (324 crashed) |
+| Loaded data | 1,374 (55%) | 10,522 (65%) |
+| Median active session | 4.6 min | 6.9 min |
+| Busiest hours (Central) | 8 a.m., 1 a.m., midnight | 3 a.m., 4 a.m., 2 a.m. |
+| Sessions 8 p.m.–5 a.m. | 50% | 46% |
+| Sessions with a fatal error (on Data) | 141 (111) | 726 (614) |
+| Error incidents | 358 | 2,766 |
+| Non-fatal incidents with only the generic message | 199 of 217 | 199 of 2,024 |
+| Highest non-fatal error rates | Bicluster 10.2%, PCA 8.6% | PCA 8.4%, Pathway 5.5% |
+| Never past Data (of loaded) | 21% | 18% |
+| Successful (of loaded / of all) | 33% / 18% | 38% / 25% |
+
+- The main stories held up: crashes happen at upload on Data, PCAtools is the biggest non-fatal problem, DEG's `ensembl_ID` crash happens on opening the tab, and successful sessions get to Stats and DEG.
+- What changed: non-fatal errors now carry real messages and `output_id` (from Sep 12), Pathway's error rate rose, Bicluster's fell, and use peaks later in the night (Central time).
+
+## When the data set changes (checklist)
+Changing `db_path` updates every inline number, but these hand-written parts must be re-checked against the new output (last checked 2026-10-26):
+- Comment in `add-tab` about `output_id`.
+- Errors intro: "often 17–19" fatal events per crash; "Until Sep 12 the app also didn't log which part of the app failed"; "Every fatal error records what went wrong" (check no fatal error has the generic message). If a new data set has no generic errors, `last_generic` is `-Inf` and that paragraph and bullet need rewording.
+- "Errors on each tab" intro: "Some non-fatal errors only show Shiny's generic message".
+- Errors intro "Some bugs also seem to have been fixed…" and the DEG bullet's "seems to have been fixed": only true while `ensembl_ID` crashes stay absent after early September (`last_ensembl`). If it shows up again in new data, reword both. The intro's "fatal rates for DEG and Stats" also assumes the crash is on those two tabs.
+- Bullets: "Most crashes are on Data"; Data bullet's sentences on "Scatter y" and the `<d0><cf>` / .xls bytes; DEG "This is likely one bug" and "after clicking Submit model"; Stats "the rest after choosing the model's factors or comparisons"; Network "too few genes or samples"; usage "324 … crashed, mostly while uploading"; data-only "Most leave almost right away" and the interpretation after it; success "A successful session usually gets through to the comparison results" and "Demo users rarely download".
+- Paths bullets: "The full workflow in app order and the shortcut from Data straight to Stats and DEG are both common"; "Many users download an early Prep or Cluster figure and keep going".
+- Demo bullets: "who mostly take data tables like significant genes and fold changes"; "Demo users are looking at what iDEP produces; own-data users are taking results away"; "Those that go on follow roughly the same route, with relatively more time on Prep, Cluster and PCA and less on Stats" (check the `demo-flow` chart); "The demo files are known to work, so this fits with crashes coming from uploaded files" (only true while demo crashes stay near 0%).
+- Endings bullets: "Starting over is the most common way a session ends on Data"; "these sessions often end right after running an analysis" (check `unclear_last` is still Submit clicks); "Few sessions are clearly stuck".
+- Chart subtitles: session length "Sessions with a fatal error are much shorter; the crash ends them"; success chart "Successful sessions use more of iDEP".
+- Time-of-day bullet: "That suggests many users are in Asia or Europe".
+- `session-flow` groups the last three tabs in app order (Genome, Bicluster, Network) as "Other tabs"; check they're still the least used.
+- Any bullet that matches message text (`n_incidents(..., msg = ...)`) shows 0 if the message disappears.
+- Stats subtab note: its example "Clicked: DEG › Submit model button" is hand-written; check that step still appears in the Stats table.
+- Then render to the scratchpad and scan every error subtab for broken tables (new symbols in messages).
+
+## Session log
+- **2026-10-21 to 10-23:** built the report (tabs, time of day, session length, errors by tab and step, usage, never past Data, success).
+- **2026-10-26:** switched to `idep_telemetry_10_24_26.sqlite`. Checked every bullet against the new output and fixed the wording that had become wrong (crash burst size, generic-message share, "most crashes on Data", Data/DEG/Stats bullets), added `data_crash_msgs`, fixed the Cluster table broken by backticks, and fixed the "changingchanges" heading typo. Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.** Raised (not yet decided): day-of-week plot, shortening error tables, the automatic Scatter x/y events, and `link_click`.
+- **2026-10-28:** added the Analysis paths subtab content: the top 5 paths of successful sessions (Q7) and why sessions end on a tab (Q4), with charts, tables and bullets. Changed the ending order so "Downloaded something" comes before "Started over". Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.** Raised (not yet decided): labelling Stats controls as "Stats" instead of "DEG" in `readable()` (they share the `deg-` prefix, so "DEG › Submit model button" shows for a Stats action), and adding an "All other paths" row to the top-5 paths table.
+  - Later the same day: filled in the **Own data vs. demo** subtab (Q6): profile table, split session-flow chart, top 5 downloads per group, and bullets. Thomas asked to compare downloads and tab use only, reusing the session-flow chart. I skipped a separate tab-use bar chart, since the profile table and flow chart cover it.
+- **2026-11-04:** the data provider said error data before Sep 13 isn't reliable. Checked the data (see "Where errors happen") and, with Thomas, chose to mark generic non-fatal errors as their own type instead of a date cutoff: added `error_type` and `last_generic`, an "Of these, generic message" column in the errors-by-tab table, generic counts in each per-tab summary line, "Unknown (…)" as the message for generic rows, and explanation text in the Errors intro. Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.**
+  - Later the same day: checked error rates per tab before Sep 6, Sep 6–12 and after Sep 12 (see "Where errors happen"). Only the `ensembl_ID` crash stopped. Added `last_ensembl`, a paragraph in the Errors intro and a sentence in the DEG bullet saying it **seems** fixed (Thomas wants it worded as likely, not certain). Suggested asking the data provider whether the app was redeployed or its error setting changed around Sep 5–6 and Sep 12, and what Sep 13 refers to. Plan for Q8: list only problems still happening after Sep 6.
+  - Also: the errors-by-tab table is now in app order (Data, Prep, Cluster, …) to match the subtabs, and the Stats error subtab has a note on why its steps say "DEG" (this settles the Oct 28 question: Thomas kept the labels and added the note instead of relabelling). Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.**
+
+- **2026-11-07:** added Q8 and Q10 to *Where iDEP falls short*, set Q9 aside (nginx data later), and treated the default-fill burst as automatic (482 more idle sessions; see "Events that fire on their own"). Defaults for Q10 come from the iDEP 2.4.4 source (an agent read GitHub). Re-checked all bullets after the idle change: only the inline numbers moved (e.g. median active session 6.9 → 7.4 min, 2,084 active-but-no-data). **The "Findings so far" numbers below are from before this change** where they count active sessions (13,088 → 12,606). Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.**
+  - Q8 findings: 13% of sessions since Sep 6 hit an error (1,482 of 11,010); 111 problems, top 10 cover 69% of those sessions. Top: PCAtools "coercible to non-negative integer" (217 sessions) and "undefined columns selected" (142), enrichment Details "Text to be written…" (126), Pathway Heatmap "unary operator" (112). 445 of 596 crashes right after an upload. Lowest recovery: Cluster "object 'obj' not found" (21% downloaded afterwards); highest: volcano label `num_genes` (61%).
+  - Q10 findings: FDR cutoff on Stats changed in 41% of Stats sessions (default 0.1 → mostly 0.05, 2,211 sessions); min fold-change 30% (2 → mostly 1.5); Pathway FDR 28% (0.1 → 0.05); Clustering method 21% (→ k-means); Prep min libraries 19% (1 → 3); VST chosen over edgeR in 535 sessions. Colors rarely changed (max 7%). Gene direction and Encircle changes are probably exploration rather than disagreement with the default (not stated in the report).
+  - Not yet fixed: `data_crash_msgs` still uses the `" at .*"` trim (its top 3 aren't affected).
+  - Later the same day:
+    - **Summary tab:** a new top-level `## Summary` tab, **last in the .qmd** so its inline R can use every object. A small `{=html}` script at the end makes the page open on it (checked in headless Edge). It holds a "Who's counted" kable (chunk `whos-counted`) and 7 key-findings bullets (`summary-findings`: `top3_problems`, `stats_gap`).
+    - **Session vocabulary (Thomas chose plain names):** **all sessions** (16,136), **active sessions** (12,629, did something), **analysis sessions** (10,522, active + loaded data), **successful sessions** (4,029, analysis + at least one download), **sessions since Sun Sep 6** (11,033, active, started after `last_generic`). All prose, captions and subtitles now use these names. Keep using them in new text.
+    - **Error tables trimmed:** `errors-by-step` shows the top 10 rows per tab, with the rest in `<details>` ("Show the other N rows"). `step_table()` builds the escaped HTML table. The intro points to *Where iDEP falls short*.
+    - `username` is a new anonymous ID for each session (16,136 distinct), so sessions can't be linked to people.
+    - **The Reset button** (`load_data-reset_app_new_data`) is a real `actionButton` that calls `session$reload()` (source, mod_01_load_data.R:1193). So it's a user action, and a reset does start a new session. The telemetry code isn't in the public repo (it's only in the deployed 2.5.0).
+    - **User actions settled (Thomas):**
+      - Scatter x/y within 3 s of a data load are automatic.
+      - Reset stays a user action.
+      - `link_click` counts.
+      - `select_model_comprions` waits for Q2.
+      - Added `events$auto_event`, which also clears `action`, so automatic events aren't error steps.
+      - Added a bullet list in Data Wrangling above `remove-idle` explaining the classification.
+      - The Data bullet's Scatter sentence became "another N right after the data loaded" (31).
+      - Counts now: 3,507 idle, 12,629 active, 2,107 active but no data, 11,033 since Sep 6. Analysis and successful sessions are unchanged.
+      - Checked every bullet: only inline numbers moved.
+      - Rendered only to the scratchpad: **Thomas's `telemetry_insights.html` still needs a re-render.**
+
+## Questions to answer (from Thomas, 2026-10-23)
+Take them one at a time, and discuss the approach with Thomas before coding. The subtab for each is in "What the .qmd does now".
+
+1. **How do they use it, and where does iDEP provide value?** **Done** (tabs used, time on tabs, session flow, never past Data).
+2. Which features do people use most, and which does almost nobody use? Not started. Watch for automatic `feature_used` events (see "Events that fire on their own").
+3. What does a "successful" session look like (uploads their own data, runs an analysis, downloads results)? What share of sessions get there? **Done** (success = at least one download).
+4. Why do sessions end on a given tab? Are users finished at that point, or are they stuck? **Done** (ending groups by last tab, in Analysis paths).
+5. Which downloads (figures, reports, data tables) are most popular? Downloads are the clearest sign someone got something they'll use. **Partly done**: there's a top-10 table in the success section.
+6. Do users who bring their own data behave differently from those who only try the demo data? **Done** (downloads and tab use).
+7. Which analysis paths (sequences of tabs) are most common? Do they match how we expect iDEP to be used? **Partly done**: top 5 paths of successful sessions only. Not yet: paths of all sessions, or comparison with the expected workflow.
+8. Where does iDEP fall short? **Done** (2026-11-07): top-15 problems table since Sep 6, with "downloaded afterwards".
+9. Do uploads fail more for certain data sizes? **Set aside (Thomas, 2026-11-07); maybe answer later with the nginx data.** The telemetry can't size failed uploads: the size buckets are only on `data_loaded` (after a successful load), and `file_upload` only has `input_id`. (Checked: after loading, data with under 1k genes crashes 6.1% vs. 2–3%, and one-group data 5.2% vs. 1–2%.) Remove its heading from the qmd.
+10. Are there settings that users keep changing away from our defaults? That's a sign the default may be wrong. **Done** (2026-11-07): 22 settings ranked by sessions that ended on a non-default value.
+
+## Ideas for next steps
+- **Closer look at errors:** the DEG ensembl_ID join bug, the PCAtools panel errors, the shared enrichment Details bug, the volcano label `num_genes` bug, and the Data upload crashes (for example, whether file type or size predicts them, using the `*_bucket` columns).
+- **Use `output_id` for non-fatal errors** (since Sep 12) to say which plot or table failed. **Thomas wants to do this at some point** (2026-11-04): e.g. a readable "Output" column (`readable(output_id)`) in the per-tab tables. Don't use it for fatal errors; it names the wrong part of the app (mostly `load_data-default_species_message` or `global`).
+- **Open questions for the data provider** (suggested 2026-11-04, not yet asked as far as I know): was the app redeployed, or its error setting (Shiny's sanitize errors) changed, around Sep 5–6 and Sep 12? What happened on Sep 13, and was anything besides the non-fatal message and `output_id` unreliable before then? If they confirm a fix, the "seems to have been fixed" wording can be firmed up.
+- **Check the 12 `ensembl_ID` crashes**: how many distinct sessions/users, and whether they share species or data size. If only one or two users, the stop may mean they left rather than a fix.
+- **Where iDEP falls short (Q8):** list only problems still happening after Sep 6, so fixed bugs (like `ensembl_ID`) aren't counted.
+- **Group fatal errors by message + `call`** (the R function that failed), counted in sessions, not events (e.g. "dim(X) must have a positive length" / `apply`: 1,767 events but 101 sessions). Suggested by the data provider; not yet done.
+- **What does "Left without a download" mean?** (Thomas asked to answer this at some point, 2026-11-07.) It's the biggest ending group (43% of loaded-data sessions), and we can't yet tell whether those users were finished or gave up. Ideas: how long they stayed on the last tab after their last action, whether they viewed results (e.g. switched result panels) before leaving, whether their last action produced an error, and how they compare with sessions that downloaded.
+- **Shorten the per-tab error tables** now that they're long (group similar messages, or show the top rows).
+- **Day-of-week / trend over time** is now possible with 8 weeks of data.
+- Handle the automatic `deg-select_model_comprions` re-renders before Q2 (features).
+- Fix `data_crash_msgs`'s `" at .*"` trim, which cuts real messages short.
+- Not done from the 2026-11-07 review: a weekly trend chart; finishing Q7 (paths of all sessions, comparison with the expected workflow); moving the downloads table under the Q5 heading; a "session ≠ person" note (Thomas didn't pick it this time).
+- Possibly add hand-written names for controls whose labels are still stiff, like "Number of min samples count" and "Number of genes network".
+- Possibly a stacked bar chart of sessions with errors per tab (fatal vs. non-fatal only).
+- **Never past Data follow-up:** check whether one-group data is the real blocker. For example, do one-group sessions that go on use only Prep, Cluster or PCA? And what does `load_data-reset_app_new_data` mean?
+- Species popularity (`species_id`).
+- Browser breakdown.
+- Features (Q2), demo vs. own data (Q6) and upload size (Q9) are in "Questions to answer".

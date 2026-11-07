@@ -1,0 +1,18 @@
+# Raw telemetry data stays local (not for a public repo, and too large)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Rendered reports
+*.html
+*_files/
+
+# Quarto, R and VS Code working files
+.quarto/
+.vdoc.*
+.Rhistory
+.RData
+.Rproj.user/
+
+# Local Claude Code settings
+.claude/settings.local.json
