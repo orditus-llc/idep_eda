@@ -9,7 +9,9 @@
   - Running `Rscript -e` from Git Bash crashes. Run R scripts from PowerShell, or from a script file.
   - **Never write the .qmd with PowerShell 5.1 `Set-Content -Encoding utf8`.** It adds a byte-order mark (BOM). With a BOM before `---`, Quarto ignores the whole YAML header (no `embed-resources`, no `grid` width). Use the Edit tool, or `[IO.File]::WriteAllText` with `UTF8Encoding $false`. If VS Code's status bar says "UTF-8 with BOM", switch it to plain UTF-8.
   - Quarto **preview** doesn't always pick up changes to `format:` options. Do a full render to check them.
-- **Working folder:** `telemetry_analysis/`
+- **Working folder (moved 2026-11-07):** `VS_Code_R_Files/GitHub/idep_eda/telemetry_analysis/`, inside the git repo `orditus-llc/idep_eda` (**public** on GitHub, branch `main`). The old `VS_Code_R_Files/telemetry_analysis/` no longer exists.
+  - **Never commit the data or the rendered HTML.** `.gitignore` at the repo root ignores `*.sqlite*`, `*.html`, `.vdoc.*` and `.claude/settings.local.json`. The repo is public, so check `git status` before every commit. A `README.md` explains where to put the data.
+  - The `db_path` fallback (`telemetry_analysis/` in front) works when the VS Code workspace is the repo root (`GitHub/idep_eda`). It doesn't work from `VS_Code_R_Files`.
   - Analysis document: `telemetry_analysis/telemetry_insights.qmd`
   - Data (current): `telemetry_analysis/data_sets/idep_telemetry_10_24_26.sqlite`. The older `idep_telemetry_9_7_26.sqlite` (Aug 29 – Sep 7) is still in the folder; the new file covers the same start date, so it replaces it rather than adding to it.
 - **Goal:** understand how people use iDEP (a Shiny app, version 2.5.0): when they use it, how long sessions last, where errors and crashes happen, and which features are used.
