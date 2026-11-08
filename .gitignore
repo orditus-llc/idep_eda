@@ -1,3 +1,21 @@
+# Raw data folders stay local: telemetry snapshots, nginx logs, IP tables
+# (never commit raw logs or IP addresses)
+data_sets/
+nginx_analysis/data_sets/
+telemetry_analysis/data_sets/
+
+# Raw nginx logs anywhere in the repo
+*.log
+*.log.*
+access.log*
+*.gz
+
+# IP-anonymization secrets and geolocation databases
+.Renviron
+.env
+*salt*
+*.mmdb
+
 # Raw telemetry data stays local (not for a public repo, and too large)
 *.sqlite
 *.sqlite-shm

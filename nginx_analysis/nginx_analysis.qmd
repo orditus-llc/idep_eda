@@ -1,0 +1,9 @@
+---
+title: "nginx Insights"
+author: "Thomas Shields"
+format:
+  html:
+    embed-resources: true
+    grid:
+      body-width: 1400px
+---
