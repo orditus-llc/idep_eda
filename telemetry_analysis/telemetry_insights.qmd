@@ -268,7 +268,8 @@ modules <- c(load_data = "Data", pre_process = "Prep", clustering = "Cluster",
              
 words <- c(dl = "download", n = "number of", num = "number of", val = "value",
            go = "GO", kegg = "KEGG", wgcna = "WGCNA", eda = "EDA", ma = "MA",
-           pca = "PCA", png = "PNG", pdf = "PDF", svg = "SVG")
+           pca = "PCA", png = "PNG", pdf = "PDF", svg = "SVG", deg = "DEG",
+           lfc = "LFC", tpm = "TPM", mds = "MDS", gc = "GC", rrna = "rRNA")
 
 readable <- function(ids) {
   u <- unique(ids)
@@ -972,7 +973,259 @@ stuck_crash_steps <- error_incidents |>
 
 #### Which features do people use most, and which does almost nobody use?
 
+This uses the events iDEP logs as **features** (`feature_used`), in analysis sessions. Only features the user chose count: the Prep scatter plot axes that iDEP sets itself when data loads are left out (see *Data Wrangling*), and so is choosing comparisons on Stats (`deg-select_model_comprions`), because iDEP also logs it whenever the list of comparisons is redrawn, so it can't be told apart from a user's choice.
+
+```{r}
+#| label: features-used
+#| code-fold: true
+#| code-summary: "Show code"
+
+features <- events |>
+  filter(session %in% loaded_sessions, type == "feature_used", user_action,
+         feature_id != "deg-select_model_comprions") |>
+  group_by(feature_id) |>
+  summarise(
+    tab      = names(which.max(table(tab))),  # where it's mostly used
+    sessions = n_distinct(session),
+    pct      = 100 * sessions / length(loaded_sessions),
+    uses     = n()
+  ) |>
+  mutate(feature = sub("^[^›]+ › ", "", readable(feature_id))) |>
+  arrange(desc(sessions), desc(uses))
+
+feature_table <- function(rows, caption) {
+  knitr::kable(
+    rows |>
+      mutate(feature_id = paste0("`", feature_id, "`")) |>
+      select(feature, feature_id, tab, sessions, pct, uses),
+    col.names = c("Feature", "ID in iDEP", "Tab", "Sessions", "% of analysis sessions", "Uses"),
+    digits = 1,
+    format.args = list(big.mark = ","),
+    caption = caption
+  )
+}
+
+feature_table(head(features, 10),
+              paste("The 10 most used features, out of", nrow(features)))
+feature_table(arrange(tail(features, 10), sessions, uses),
+              "The 10 least used features, least used first")
+```
+
 #### Which downloads (figures, reports, data tables) are most popular?
+
+This covers downloads in analysis sessions. Each download is placed on the tab the user was on when they clicked it. That isn't always the module its ID names: the Stats tab's downloads have IDs that start with `deg-`. Each download is sorted into a kind by its ID: a **figure** (PNG, PDF or SVG), a **report** (HTML), **R code or session** (the DEG R code and the saved session file), or a **data table** (everything else, all CSV files or similar). The charts count downloads, so a user who downloads the same file several times counts each time; the labels also give the number of sessions.
+
+```{r}
+#| label: downloads-by-tab
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Every download in an analysis session, with its kind and, for figures,
+# its format. Figures come as PNG, PDF and SVG versions of the same plot;
+# item_id is the plot without the format, so the versions count together.
+# KEGG and the WGCNA module plot are PNG files without a format in the ID.
+dl_kinds <- c("Data table", "Figure", "Report", "R code or session")
+
+downloads <- events |>
+  filter(session %in% loaded_sessions, type == "download", user_action) |>
+  mutate(
+    download = sub("^Downloaded: ", "", action),
+    format   = case_when(
+      grepl("[-_](png|pdf|svg)$", id) ~ toupper(sub(".*[-_]", "", id)),
+      id %in% c("pathway-download_kegg", "network-dl_module_plot") ~ "PNG"
+    ),
+    kind = factor(case_when(
+      !is.na(format)                                  ~ "Figure",
+      grepl("report", id)                             ~ "Report",
+      id %in% c("deg-dl_deg_code", "pre_process-rds") ~ "R code or session",
+      TRUE                                            ~ "Data table"
+    ), levels = dl_kinds),
+    item_id = sub("([-_](dl|download))?[-_](png|pdf|svg)$", "", id)
+  )
+
+# Tabs ordered by number of downloads, most at the top
+dl_tab_totals <- downloads |>
+  filter(tab %in% tabs) |>
+  group_by(tab) |>
+  summarise(n = n(), sessions = n_distinct(session)) |>
+  arrange(n) |>
+  mutate(label = sprintf("%s downloads · %s sessions", num(n), num(sessions)))
+
+dl_by_kind <- downloads |>
+  filter(tab %in% tabs) |>
+  count(tab, kind) |>
+  mutate(tab = factor(tab, levels = dl_tab_totals$tab))
+
+kind_colours <- c("Data table" = "#2a78d6", "Figure" = "#eb6834",
+                  "Report" = "#1baf7a", "R code or session" = "#eda100")
+
+ggplot(dl_by_kind, aes(n, tab, fill = kind)) +
+  geom_col(position = position_stack(reverse = TRUE), width = 0.7,
+           colour = "white", linewidth = 0.3) +
+  geom_text(data = mutate(dl_tab_totals, tab = factor(tab, levels = tab)),
+            aes(n, tab, label = label), inherit.aes = FALSE,
+            hjust = -0.05, size = 3.2, colour = "#52514e") +
+  scale_fill_manual(values = kind_colours, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.35))) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title = "Which tabs users download from",
+    subtitle = "Downloads in analysis sessions, by the tab they were on and the kind of file",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: figure-formats
+#| code-fold: true
+#| code-summary: "Show code"
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Figure downloads only, by tab and file format
+fig_totals <- downloads |>
+  filter(kind == "Figure", tab %in% tabs) |>
+  group_by(tab) |>
+  summarise(n = n(), sessions = n_distinct(session)) |>
+  arrange(n) |>
+  mutate(label = sprintf("%s figures · %s sessions", num(n), num(sessions)))
+
+fig_formats <- downloads |>
+  filter(kind == "Figure", tab %in% tabs) |>
+  count(tab, format) |>
+  group_by(tab) |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  mutate(tab    = factor(tab, levels = fig_totals$tab),
+         format = factor(format, levels = c("PNG", "PDF", "SVG")))
+
+format_colours <- c(PNG = "#6250d6", PDF = "#e87ba4", SVG = "#008300")
+
+ggplot(fig_formats, aes(n, tab, fill = format)) +
+  geom_col(position = position_stack(reverse = TRUE), width = 0.7,
+           colour = "white", linewidth = 0.3) +
+  # Share of the tab's figure downloads, on segments wide enough to hold it
+  geom_text(aes(label = if_else(n >= 0.06 * max(fig_totals$n),
+                                sprintf("%.0f%%", 100 * share), ""),
+                group = format),
+            position = position_stack(vjust = 0.5, reverse = TRUE),
+            size = 3, colour = "white") +
+  geom_text(data = mutate(fig_totals, tab = factor(tab, levels = tab)),
+            aes(n, tab, label = label), inherit.aes = FALSE,
+            hjust = -0.05, size = 3.2, colour = "#52514e") +
+  scale_fill_manual(values = format_colours, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.35))) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title = "Which tabs users download figures from, and in which format",
+    subtitle = "Figure downloads in analysis sessions; segments show each format's share of the tab's figures",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "#52514e")
+  )
+```
+
+```{r}
+#| label: top-downloads
+#| code-fold: true
+#| code-summary: "Show code"
+
+# One row per downloadable item, with a figure's PNG, PDF and SVG versions
+# together. The label drops the module name (the Tab column says where
+# it was downloaded) and words like "download"; the ID is iDEP's own.
+dl_items <- downloads |>
+  group_by(item_id, kind) |>
+  summarise(
+    tab       = names(which.max(table(tab))),
+    sessions  = n_distinct(session),
+    pct       = 100 * sessions / length(loaded_sessions),
+    downloads = n(),
+    formats   = if (all(is.na(format))) "" else
+      paste0(names(sort(table(format), decreasing = TRUE)), " ",
+             round(100 * sort(table(format), decreasing = TRUE) / sum(!is.na(format))), "%",
+             collapse = ", "),
+    .groups = "drop"
+  ) |>
+  mutate(item = sub("^[^›]+ › ", "",
+                    readable(gsub("(^|-)(dl|download)_|_download$", "\\1", item_id)))) |>
+  arrange(desc(sessions), desc(downloads))
+
+dl_table <- function(rows, caption = NULL) {
+  knitr::kable(
+    rows |>
+      mutate(item_id = paste0("<code>", item_id, "</code>")) |>
+      select(item, item_id, tab, kind, sessions, pct, downloads, formats),
+    format = "html",
+    escape = FALSE,
+    col.names = c("Download", "ID in iDEP", "Tab", "Kind", "Sessions",
+                  "% of analysis sessions", "Downloads", "Formats (share of downloads)"),
+    digits = 1,
+    format.args = list(big.mark = ","),
+    caption = caption,
+    table.attr = 'class="table table-sm"'
+  )
+}
+
+# The top 15, with every other item in a collapsed section below
+knitr::asis_output(paste0(
+  dl_table(head(dl_items, 15),
+           paste0("The 15 downloads used by the most sessions, out of ", nrow(dl_items),
+                  " (a figure's PNG, PDF and SVG versions count as one)")),
+  "\n\n<details><summary>Show the other ", nrow(dl_items) - 15, " downloads</summary>\n\n",
+  dl_table(tail(dl_items, -15)),
+  "\n\n</details>\n"
+))
+```
+
+```{r}
+#| label: findings-downloads
+#| include: false
+
+dl_sessions <- n_distinct(downloads$session)
+
+top_dl_tabs <- head(arrange(dl_tab_totals, desc(n)), 3)
+
+# Share of downloads, and of downloading sessions, for each kind
+kind_share <- downloads |>
+  group_by(kind) |>
+  summarise(pct_dl = 100 * n() / nrow(downloads),
+            pct_sessions = 100 * n_distinct(session) / dl_sessions)
+kind_pct <- \(k, col = "pct_dl") pct(kind_share[[col]][kind_share$kind == k])
+
+# Formats of all figure downloads
+fmt_share <- downloads |>
+  filter(kind == "Figure") |>
+  count(format) |>
+  mutate(pct = 100 * n / sum(n))
+fmt_pct <- \(f) pct(fmt_share$pct[fmt_share$format == f])
+
+# Items hardly anyone downloads
+rare_items <- filter(dl_items, sessions < 10)
+```
+
+- `r num(nrow(downloads))` downloads in `r num(dl_sessions)` analysis sessions, of `r nrow(dl_items)` different items (counting a figure's formats as one).
+- The most downloads come from `r knitr::combine_words(paste0(top_dl_tabs$tab, " (", num(top_dl_tabs$n), " downloads, ", num(top_dl_tabs$sessions), " sessions)"))`.
+- Data tables are `r kind_pct("Data table")` of downloads, figures `r kind_pct("Figure")`, reports `r kind_pct("Report")`, and R code or session files `r kind_pct("R code or session")`. Counted by session, `r kind_pct("Data table", "pct_sessions")` of sessions that download anything take a data table, `r kind_pct("Figure", "pct_sessions")` a figure and `r kind_pct("Report", "pct_sessions")` a report.
+- Figures are mostly PNG: `r fmt_pct("PNG")` of figure downloads, against `r fmt_pct("PDF")` PDF and `r fmt_pct("SVG")` SVG.
+- `r nrow(rare_items)` of the `r nrow(dl_items)` items were downloaded in fewer than 10 sessions over the whole period. They're at the bottom of the full list under the table.
 
 #### What does a successful session look like, and what share of sessions get there?
 
@@ -1039,25 +1292,6 @@ ggplot(success_tabs, aes(pct, tab, fill = outcome)) +
 ```
 
 ```{r}
-#| label: top-downloads
-#| code-fold: true
-#| code-summary: "Show code"
-
-downloads <- events |>
-  filter(session %in% loaded_sessions, type == "download", user_action) |>
-  mutate(download = sub("^Downloaded: ", "", action))
-
-downloads |>
-  group_by(download) |>
-  summarise(sessions = n_distinct(session), downloads = n()) |>
-  arrange(desc(sessions), desc(downloads)) |>
-  head(10) |>
-  knitr::kable(col.names = c("Download", "Sessions", "Downloads"),
-               format.args = list(big.mark = ","),
-               caption = "The ten downloads used by the most sessions")
-```
-
-```{r}
 #| label: findings-success
 #| include: false
 
@@ -1071,17 +1305,15 @@ tab_gap <- success_tabs |>
   mutate(gap = Successful - `No download`) |>
   slice_max(gap, n = 2, with_ties = FALSE)
 
-top_downloads <- downloads |>
-  group_by(download) |>
-  summarise(sessions = n_distinct(session)) |>
-  slice_max(sessions, n = 3, with_ties = FALSE)
+# The three downloads used by the most sessions (see the downloads table)
+top_downloads <- head(dl_items, 3)
 ```
 
 - `r num(nrow(successful))` sessions are successful: `r pct(100 * nrow(successful) / length(loaded_sessions))` of analysis sessions, or `r pct(100 * nrow(successful) / n_sessions_all)` of all sessions.
 - Successful sessions use a median of `r median(successful$n_tabs)` tabs and `r mins(median(successful$active_min))` of active time, compared with `r median(no_dl$n_tabs, na.rm = TRUE)` tabs and `r mins(median(no_dl$active_min, na.rm = TRUE))` for analysis sessions with no download.
 - The biggest differences are on `r knitr::combine_words(paste0(tab_gap$tab, " (", pct(tab_gap$Successful), " vs. ", pct(tab_gap$"No download"), ")"))`. A successful session usually gets through to the comparison results.
 - Demo users rarely download: `r share(successful$source == "demo")` of successful sessions used the demo data, compared with `r share(no_dl$source == "demo")` of analysis sessions with no download.
-- A successful session downloads a median of `r median(successful$downloads)` things. The downloads used by the most sessions are `r knitr::combine_words(paste0('"', top_downloads$download, '" (', top_downloads$sessions, " sessions)"))`.
+- A successful session downloads a median of `r median(successful$downloads)` things. The downloads used by the most sessions are `r knitr::combine_words(paste0('"', top_downloads$item, '" on ', top_downloads$tab, " (", num(top_downloads$sessions), " sessions)"))`.
 
 ### Analysis paths
 
@@ -1663,6 +1895,8 @@ top_color <- filter(by_share, grepl("colors", setting))[1, ]
 ### Who's counted
 
 The report counts **sessions**: one visit to iDEP, from opening the app to closing it. Each finding is out of one of these groups, and says which.
+
+**A session is not a person.** The telemetry gives every session a new anonymous ID, so sessions from the same person can't be linked. One person can show up as several sessions: loading new data or pressing Reset starts a new session, and so does coming back another day. The report can't say how many people use iDEP, only how many sessions.
 
 ```{r}
 #| label: whos-counted
